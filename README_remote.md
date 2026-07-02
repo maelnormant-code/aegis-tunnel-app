@@ -1,0 +1,1576 @@
+# Qubes OS Builder
+
+This is the second generation of the Qubes OS builder. This new builder
+leverages container or disposable qube isolation to perform every stage of the
+build and release process. From fetching sources to building them, everything
+is executed inside a "cage" (either a disposable or a container) with the
+help of what we call an "executor." For every command that needs to perform an
+action on sources, like cloning and verifying Git repos, rendering a SPEC
+file, generating SRPM or Debian source packages, a new cage is used. Only the
+signing, publishing, and uploading processes are executed locally outside a
+cage. (This will be improved in the future.) For now, only Docker, Podman,
+Local, Qubes and Windows executors are available.
+
+
+## Dependencies
+
+Fedora:
+
+```bash
+$ sudo dnf install $(cat dependencies-fedora.txt)
+$ test -f /usr/share/qubes/marker-vm && sudo dnf install qubes-gpg-split
+```
+
+Debian:
+
+```bash
+$ sudo apt install $(cat dependencies-debian.txt)
+$ test -f /usr/share/qubes/marker-vm && sudo apt install qubes-gpg-split
+```
+
+> Remark: Sequoia packages `sequoia-chameleon-gnupg` is available since Trixie (Debian 13).
+
+Fetch submodules:
+
+```bash
+$ git submodule update --init
+```
+
+## Docker executor
+
+Add `user` to the `docker` group if you wish to avoid using `sudo`:
+
+```
+$ usermod -aG docker user
+```
+
+You may need to `sudo su user` to get this to work in the current shell. You
+can add this group owner change to `/rw/config/rc.local`.
+
+In order to use the Docker executor, you must build the image using the
+provided dockerfiles. Docker images are built from `scratch` with `mock`
+chroot cache archive. The rational is to use only built-in distribution
+tool that take care of verifying content and not third-party content
+like Docker images from external registries. As this may not be possible
+under Debian as build host, we allow to pull Fedora docker image with
+a specific sha256.
+
+In order to ease Docker or Podman image generation, a tool `generate-container-image.sh`
+is provided under `tools` directory. It takes as input container engine
+and optionally the Mock configuration file path or identifier.
+
+For example, to build a Fedora 36 x86-64 docker image with `mock`:
+```bash
+$ tools/generate-container-image.sh docker fedora-36-x86_64
+```
+or a Podman image:
+```bash
+$ tools/generate-container-image.sh podman fedora-36-x86_64
+```
+
+If not specifying the `mock` configuration, it will simply build the
+docker image based on the Fedora docker image.
+
+### Detailed steps for Mock
+
+You may want to customize your `mock` build process instead of using `generate-container-image.sh`.
+
+First, build Mock chroot according to your own configuration or use
+default ones provided. For example, to build a Fedora 36 x86-64 mock
+chroot from scratch:
+```bash
+$ sudo mock --init --no-bootstrap-chroot --config-opts chroot_setup_cmd='install dnf @buildsys-build' -r fedora-36-x86_64
+```
+
+By default, it creates a `config.tar.gz` located at `/var/cache/mock/fedora-36-x86_64/root_cache/`.
+Second, build the docker image:
+```bash
+$ docker build -f dockerfiles/fedora.Dockerfile -t qubes-builder-fedora /var/cache/mock/fedora-36-x86_64/root_cache/
+```
+
+## Qubes executor
+
+We assume that the [template](https://www.qubes-os.org/doc/templates/) chosen
+for building components inside a disposable qube is `fedora-39`. Install the
+following dependencies inside the template:
+
+```bash
+$ sudo dnf install $(cat dependencies-fedora-qubes-executor.txt)
+```
+
+Then, clone the disposable template based on Fedora 39, `fedora-39-dvm`, to
+`qubes-builder-dvm`. Set its private volume storage space to at least 30 GB.
+
+Let's assume that the qube hosting `qubes-builder` is called `work-qubesos`.
+In `dom0`, render and install the RPC policy (adjust the variable values if
+your qube names differ):
+
+```bash
+SOURCE_QUBE=work-qubesos
+BUILDER_DVM=qubes-builder-dvm
+cat <<EOF | sudo tee /etc/qubes/policy.d/50-qubesbuilder.policy
+admin.vm.CreateDisposable * ${SOURCE_QUBE} dom0 allow target=dom0
+admin.vm.CreateDisposable * ${SOURCE_QUBE} ${BUILDER_DVM} allow target=dom0
+
+admin.vm.CurrentState * ${SOURCE_QUBE} @tag:disp-created-by-${SOURCE_QUBE} allow target=dom0
+admin.vm.List         * ${SOURCE_QUBE} @tag:disp-created-by-${SOURCE_QUBE} allow target=dom0
+admin.vm.Start        * ${SOURCE_QUBE} @tag:disp-created-by-${SOURCE_QUBE} allow target=dom0
+admin.vm.Kill         * ${SOURCE_QUBE} @tag:disp-created-by-${SOURCE_QUBE} allow target=dom0
+admin.vm.Remove       * ${SOURCE_QUBE} @tag:disp-created-by-${SOURCE_QUBE} allow target=dom0
+
+qubesbuilder.FileCopyIn  * ${SOURCE_QUBE} @tag:disp-created-by-${SOURCE_QUBE} allow
+qubesbuilder.FileCopyOut * ${SOURCE_QUBE} @tag:disp-created-by-${SOURCE_QUBE} allow
+
+qubes.Filecopy       * ${SOURCE_QUBE} @tag:disp-created-by-${SOURCE_QUBE} allow
+qubes.WaitForSession * ${SOURCE_QUBE} @tag:disp-created-by-${SOURCE_QUBE} allow
+qubes.VMShell        * ${SOURCE_QUBE} @tag:disp-created-by-${SOURCE_QUBE} allow
+EOF
+```
+
+Now, start the disposable template `qubes-builder-dvm` and create the following
+directories:
+
+```bash
+$ sudo mkdir -p /rw/bind-dirs/builder /rw/config/qubes-bind-dirs.d
+```
+
+Create the file `/rw/config/qubes-bind-dirs.d/builder.conf` with the contents:
+
+```
+binds+=('/builder')
+```
+
+Append to `/rw/config/rc.local` the following:
+
+```
+mount /builder -o dev,suid,remount
+```
+
+Set `qubes-builder-dvm` as the default disposable template for `work-qubesos`:
+
+```bash
+$ qvm-prefs work-qubesos default_dispvm qubes-builder-dvm
+```
+
+### Qubes executor for secureboot signing
+
+The `vmm-xen-unified` component builds a signed unified Xen+Linux binary. It
+requires additional setup for the signing process. This approach will use
+separate disposable template for just `vmm-xen-unified` component and have that
+disposable access to the signing service.
+
+Building `vmm-xen-unified` with docker executor is currently not supported.
+
+First, you will need to generate (or otherwise obtain) signing key. This step
+is not specific to qubes-builderv2, can be done with any tool. See README in
+`vmm-xen-unified` for example approach. Store the keys in a separate
+(preferably network-disconnected) qube (if you use HSM or other hardware token
+- configure its usage in that qube). Later steps in this instruction use
+`vault-pesign` name for this qube, but it can be anything. Copy
+`rpc/qubesbuilder.PESign` to `/usr/local/etc/qubes-rpc` in the key-holding qube
+and make sure it's executable:
+```
+chmod +x /usr/local/etc/qubes-rpc/qubesbuilder.PESign
+```
+
+If extra parameters for using the key are needed for `pesign`, add `/home/user/.config/qubes-pesign/CERT_NICKNAME` (where `CERT_NICKNAME` is a name used for `KEY_NAME` value later in this instruciton) to set the arguments, for example:
+```
+# dbpath with pkcs11 module configured
+PESIGN_ARGS+=( "--certdir=$HOME/pesign-token-db" )
+# token name
+PESIGN_ARGS+=( "--token=token name" )
+# pinfile path, if relevant
+PESIGN_ARGS+=( "--pinfile=$HOME/pesign-token-pin.txt" )
+# you can also override CERTIFICATE
+CERTIFICATE="certificate name as on the token"
+```
+
+After doing that, create new disposable template following the above
+instructions, but name it `qubes-pesign-builder-dvm`.
+
+Then, in the `qubes-pesign-builder-dvm` do the following:
+```
+mkdir -p /rw/bind-dirs/etc/systemd/system/
+mkdir -p /usr/local/etc/default
+# adjust value if you used different key nickname, replace spaces with __
+echo 'KEY_NAME="Qubes__OS__Unified__Kernel__Image__Signing__Key"' > /usr/local/etc/default/qubes-pesign
+mkdir -p /rw/config/qubes-bind-dirs.d
+cat <<EOF > /rw/config/qubes-bind-dirs.d/50_qubes-pesign.conf
+binds+=( '/etc/systemd/system/qubes-pesign.socket' )
+binds+=( '/etc/systemd/system/qubes-pesign@.service' )
+EOF
+```
+
+Copy `rpc/qubes-pesign*` from qubes-builderv2 into `/rw/bind-dirs/etc/systemd/system/` in `qubes-pesign-builder-dvm` and set appropriate SELinux context (if SELinux is enabled there):
+```
+restorecon /rw/bind-dirs/etc/systemd/system/*
+```
+
+Add starting the service in `/rw/config/rc.local`:
+```
+systemctl daemon-reload
+systemctl start qubes-pesign.socket
+```
+
+Next step is to adjust qrexec policy to allow signing. To not depend on specific dispvm name, the policy will use tags. The `rpc/policy/50-qubesbuilder.policy` file contains commented-out example. Adjust key-holding qube name and possibly certificat nickname there.
+And then add appropriate tag to the `qubes-pesign-builder-dvm`:
+```
+qvm-tags qubes-pesign-builder-dvm add pesign-allow
+```
+
+And finally, enable building `vmm-xen-unified` using just configured disposable
+template by adding the following to your `builder.yml`:
+
+```
++components:
+  - vmm-xen-unified:
+      packages: true
+      stages:
+      - build:
+          executor:
+            type: qubes
+            options:
+              dispvm: qubes-pesign-builder-dvm
+```
+
+## Windows executors and building Windows Tools
+
+Two Windows executor types are available: `windows-ssh` (`SSHWindowsExecutor`) and `windows` (`WindowsQubesExecutor`).
+Both require the same prerequisites as the Qubes executor (see above).
+
+### `windows-ssh` executor (SSH to a Windows machine)
+
+This executor communicates with a Windows build machine over SSH.
+It is used for the initial bootstrap for building Qubes Windows Tools before QWT is available to install.
+The worker can be either a dedicated Qubes HVM qube (set up with the scripts below) or any SSH-accessible Windows 10/11 machine you manage manually.
+
+#### Option A - Automated Qubes HVM setup
+
+The `tools/windows/` directory contains scripts that create and fully configure the bootstrap worker qube.
+You need an unmodified Windows 10 or 11 installation ISO and about 50 GiB of free disk space.
+`genisoimage` must be installed in the builder disposable template (`qubes-builder-dvm`).
+
+**1 - Download prerequisites and build the installation ISO**
+
+Run the following from inside the builder qube (`work-qubesos`):
+
+```bash
+cd tools/windows
+./generate-iso.sh --iso /path/to/windows.iso --output win-build.iso
+```
+
+`generate-iso.sh` does the following:
+
+- Downloads and SHA256-verifies three prerequisites via a disposable VM:
+  - `win-opensshd.msi` - Win32-OpenSSH server
+  - `ewdk.iso` - Microsoft Enterprise WDK (used at build time)
+  - `git.exe` - Git for Windows
+- Generates an SSH key pair at `~/.ssh/win-build.key` (skips generation if the key already exists). The public key is embedded in the installation image.
+- Calls `edit-iso.sh`, which mounts the source ISO in a disposable VM, injects `autounattend.xml` and the helper scripts into the image, and writes the result to `win-build.iso`.
+
+The resulting ISO performs a fully unattended Windows installation: disk partitioning, user creation, Git and OpenSSH server installation and SSH key authorisation.
+
+**2 - Create the bootstrap worker qube**
+
+Run in `dom0`:
+
+```bash
+# Copy the script to dom0 first
+qvm-run --pass-io work-qubesos 'cat tools/windows/dom0/create-vm.sh' > /tmp/create-vm.sh
+bash /tmp/create-vm.sh --iso work-qubesos:/home/user/tools/windows/win-build.iso
+```
+
+`create-vm.sh` does the following:
+
+- Creates a `StandaloneVM` HVM named `win-build` with a 40 GiB root volume.
+- Configures the firewall: all outbound traffic from the worker qube is **blocked**; inbound connections from the builder qube to the worker are allowed via an `nft` rule in the shared firewall VM.
+- Boots the worker with the installation ISO attached, then polls via SSH until Windows finishes the unattended setup (this takes several minutes).
+- Shuts the worker down. The EWDK ISO is attached automatically by the executor at build time via `admin.vm.device.block.Attach` (default `ewdk-mode: attach`). It does not need to be attached manually. Alternatively, set `ewdk-mode: copy` to have the executor SCP the ISO into the VM and mount it with PowerShell instead.
+
+**3 - Build QWT using `windows-ssh`**
+
+Use `windows-ssh` to connect directly to `win-build` over SSH.
+Get its IP address from `dom0`:
+
+```bash
+qvm-prefs win-build ip
+```
+
+Configure `builder.yml`:
+
+```yaml
+# builder.yml
+distributions:
+  - vm-win10:
+      stages:
+        - build:
+            executor:
+              type: windows-ssh
+              options:
+                ssh-ip: 10.137.0.20           # output of: qvm-prefs win-build ip
+                ssh-vm: win-build             # auto-start worker qube
+                ewdk: tools/windows/ewdk.iso  # path inside work-qubesos
+                ewdk-mode: attach             # 'attach' (default): Qubes block device attach
+                                              # 'copy': SCP ISO into VM, mount via PowerShell
+                user: user
+```
+
+See `Windows-specific build stage options` section for all the available options.
+
+#### Option B - Manual or external Windows machine
+
+If you already have a Windows 10/11 machine accessible over SSH (whether a Qubes HVM you configured yourself, a bare-metal machine, or a VM in another hypervisor), skip the scripts above.
+
+First, download the EWDK ISO on the builder host using `get-files.sh`:
+
+```bash
+tools/windows/get-files.sh -o tools/windows tools/windows/deps.txt
+```
+
+This downloads `ewdk.iso` into `tools/windows/`.
+
+Configure the executor with the local path to the ISO:
+
+```yaml
+distributions:
+  - vm-win10:
+      stages:
+        - build:
+            executor:
+              type: windows-ssh
+              options:
+                ssh-ip: 10.137.0.20              # IP of the Windows machine
+                ssh-key-path: ~/.ssh/win-build.key
+                user: user
+                ewdk: tools/windows/ewdk.iso     # SCPed to c:\Users\<user>\ewdk.iso on first run
+```
+
+On each build run, the executor will:
+1. Compute the SHA256 of the local `ewdk.iso` and compare it against `c:\Users\<user>\ewdk.iso` on the remote machine. The ISO is transferred only if missing or the checksum differs.
+2. Mount the ISO via PowerShell `Mount-DiskImage` (idempotent and skipped if already mounted).
+
+The machine must have OpenSSH server running and the builder's public key authorised.
+
+### `windows` executor (Windows disposable qubes)
+
+This executor works like the Linux Qubes executor: each build runs inside a fresh Windows disposable qube created from a template.
+It requires a separate `win-build` qube configured as a disposable VM template (`template_for_dispvms=true`) with Qubes Windows Tools installed.
+Setting up this dispvm template is a distinct procedure: install QWT (built via `windows-ssh` above) into a Windows qube, then mark it as a dispvm template in `dom0`:
+
+```bash
+qvm-prefs win-build template_for_dispvms true
+```
+
+The `qubesbuilder.WinFileCopyIn` and `qubesbuilder.WinFileCopyOut` RPC handlers (from `rpc/`) are copied into the disposable qube at runtime by the executor, so no manual persistent installation is required in `win-build`.
+
+> **Note:** The `c:\build` directory must **not** exist in the `win-build` template. Its presence can cause build failures when the executor copies files into the disposable. If you converted a qube previously used for SSH-based builds into the disposable template, make sure to delete that directory before marking it as `template_for_dispvms`.
+
+Once `win-build` is ready, configure the builder:
+
+```yaml
+distributions:
+  - vm-win10:
+      stages:
+        - build:
+            executor:
+              type: windows
+              options:
+                dispvm: win-build             # disposable template (default: win-build)
+                ewdk: tools/windows/ewdk.iso  # path inside work-qubesos
+                user: user
+```
+
+### Code signing vault qube
+
+Authenticode signing is performed by a separate vault-type qube (referred to as `vault-sign` in the examples below). The signing qube never has network access. The builder communicates with it exclusively through Qubes RPC.
+
+**1 - Install RPC services in the signing qube**
+
+Copy the `rpc/qubesbuilder.WinSign.*` scripts into `vault-sign` and make them persistent:
+
+```bash
+# Inside vault-sign (or via qvm-run)
+sudo mkdir -p /usr/local/etc/qubes-rpc
+sudo cp qubesbuilder.WinSign.{common,CreateKey,DeleteKey,GetCert,QueryKey,Sign} /usr/local/etc/qubes-rpc/
+sudo restorecon -R /usr/local/etc/qubes-rpc/
+```
+
+Signing keys are stored in `/home/user/win-sign/keys/` inside the vault qube.
+For test signing, keys are generated automatically (ephemeral per component).
+For production signing, import your CA-signed key into that directory beforehand.
+
+**2 - Install the timestamp service in the Linux disposable template**
+
+The `qubesbuilder.WinSign.Timestamp` service runs in the default Linux disposable template `qubes-builder-dvm`:
+
+```bash
+# Inside qubes-builder-dvm (or via qvm-run)
+sudo cp rpc/qubesbuilder.WinSign.Timestamp /usr/local/etc/qubes-rpc/
+sudo restorecon -R /usr/local/etc/qubes-rpc/
+```
+
+`osslsigncode` must be installed in the template used by `qubes-builder-dvm`.
+
+**3. Install the RPC policy in dom0**
+
+Render and install the policy from `dom0` (adjust the variable values to match
+your qube names):
+
+```bash
+SOURCE_QUBE=work-qubesos
+WINDOWS_BUILDER=win-build
+WINDOWS_VAULT=vault-sign
+cat <<EOF | sudo tee /etc/qubes/policy.d/51-qubesbuilder-windows.policy
+admin.vm.device.block.Attach    * ${SOURCE_QUBE} @tag:disp-created-by-${SOURCE_QUBE} allow target=dom0
+admin.vm.device.block.Assign    * ${SOURCE_QUBE} @tag:disp-created-by-${SOURCE_QUBE} allow target=dom0
+qubesbuilder.WinSign.Timestamp  * ${SOURCE_QUBE} @tag:disp-created-by-${SOURCE_QUBE} allow
+qubesbuilder.WinFileCopyIn      * ${SOURCE_QUBE} @tag:disp-created-by-${SOURCE_QUBE} allow
+qubesbuilder.WinFileCopyOut     * ${SOURCE_QUBE} @tag:disp-created-by-${SOURCE_QUBE} allow
+
+admin.vm.device.block.Available * ${SOURCE_QUBE} ${SOURCE_QUBE} allow target=dom0
+
+admin.vm.CurrentState           * ${SOURCE_QUBE} ${WINDOWS_BUILDER} allow target=dom0
+admin.vm.List                   * ${SOURCE_QUBE} ${WINDOWS_BUILDER} allow target=dom0
+admin.vm.Start                  * ${SOURCE_QUBE} ${WINDOWS_BUILDER} allow target=dom0
+admin.vm.device.block.Attached  * ${SOURCE_QUBE} ${WINDOWS_BUILDER} allow target=dom0
+admin.vm.device.block.Assigned  * ${SOURCE_QUBE} ${WINDOWS_BUILDER} allow target=dom0
+admin.vm.device.block.Attach    * ${SOURCE_QUBE} ${WINDOWS_BUILDER} allow target=dom0
+admin.vm.device.block.Assign    * ${SOURCE_QUBE} ${WINDOWS_BUILDER} allow target=dom0
+
+qubesbuilder.WinSign.QueryKey  +Qubes__Windows__Tools ${SOURCE_QUBE} ${WINDOWS_VAULT} allow
+qubesbuilder.WinSign.CreateKey +Qubes__Windows__Tools ${SOURCE_QUBE} ${WINDOWS_VAULT} allow
+qubesbuilder.WinSign.DeleteKey +Qubes__Windows__Tools ${SOURCE_QUBE} ${WINDOWS_VAULT} allow
+qubesbuilder.WinSign.GetCert   +Qubes__Windows__Tools ${SOURCE_QUBE} ${WINDOWS_VAULT} allow
+qubesbuilder.WinSign.Sign      +Qubes__Windows__Tools ${SOURCE_QUBE} ${WINDOWS_VAULT} allow
+EOF
+```
+
+
+### General recommendations
+
+It is recommended to turn off Microsoft Defender in the worker qube (especially real-time protection) because it slows down building significantly. This is not done during unattended setup because there is no supported way for automating this.
+
+TODO: it enables itself after restart which is a pain for dispvms.
+
+
+## Build stages
+
+The build process consists of the following stages:
+
+- `fetch` --- download and verify sources
+- `prep` --- create source packages
+- `build` --- build source packages
+- `post` --- post-build processing
+- `verify` --- verify built packages
+- `sign` --- sign built packages
+- `publish` --- publish signed packages to a local repository
+- `upload` --- upload the published repository to a remote server
+
+There is also a special stage not part of the default sequence:
+
+- `init-cache` --- initialize the chroot cache (Mock, pbuilder, etc.)
+
+### Stage dependencies
+
+When calling a source-building stage, prerequisite stages are resolved and
+run automatically in the right order:
+
+- `prep` runs `fetch` first (if not already done), then `init-cache`, then `prep`
+- `build` runs `fetch`, `init-cache`, `prep`, then `build`
+- `post` and `verify` follow the same pattern
+- `sign` runs `fetch`, `init-cache`, `prep`, `build`, then `sign`
+- `publish` runs `fetch`, `init-cache`, `prep`, `build`, `sign`, then `publish`
+
+`upload` and `init-cache` work from artifacts already on disk and do not
+trigger `fetch` or earlier stages.
+
+### Fetch behavior
+
+`fetch` runs automatically when any of `prep`, `build`, `post`, `verify`,
+`sign`, or `publish` are requested, unless `skip-git-fetch: true` is set in
+the configuration. It runs at most once per session even when stages are
+chained.
+
+Only `upload` and `init-cache` never trigger `fetch`.
+
+The devel version counter (`increment-devel-versions`) is bumped whenever
+fetch detects that the source has changed.
+
+
+## Plugins
+
+- `fetch` --- fetch and verify sources
+- `source` --- common source package logic
+- `source_rpm` --- RPM source packages
+- `source_deb` --- Debian source packages
+- `source_windows` --- Windows sources
+- `chroot_rpm` --- Mock chroot cache (`init-cache`)
+- `chroot_deb` --- pbuilder chroot cache (`init-cache`)
+- `chroot_archlinux` --- Arch Linux chroot cache (`init-cache`)
+- `build` --- common build logic
+- `build_rpm` --- RPM builds
+- `build_deb` --- Debian builds
+- `build_windows` --- Windows builds (Visual Studio)
+- `build_archlinux` --- Arch Linux builds
+- `sign` --- common signing logic
+- `sign_rpm` --- RPM signing
+- `sign_deb` --- Debian signing
+- `publish` --- common publish logic
+- `publish_rpm` --- RPM repository publishing
+- `publish_deb` --- Debian repository publishing
+- `publish_archlinux` --- Arch Linux repository publishing
+- `upload` --- upload published repository to a remote server
+- `list_deps` --- base plugin for the `list-deps` stage
+- `list_deps_rpm` --- RPM build dependency extraction
+- `list_deps_deb` --- Debian build dependency extraction
+- `list_deps_archlinux` --- Arch Linux build dependency extraction
+- `template` --- common template build logic
+- `template_rpm` --- RPM-based template builds
+- `template_deb` --- Debian-based template builds
+- `template_whonix` --- Whonix template builds
+
+
+## CLI
+
+```bash
+Usage: qb [OPTIONS] COMMAND [ARGS]...
+
+  Main CLI
+
+Options:
+  --verbose / --no-verbose  Increase log verbosity.
+  --debug / --no-debug      Print full traceback on exception.
+  --builder-conf TEXT       Path to configuration file (default: builder.yml).
+  --log-file TEXT           Path to log file to be created.
+  -c, --component TEXT      Specify component to treat (can be repeated).
+  -d, --distribution TEXT   Set distribution to treat (can be repeated).
+  -t, --template TEXT       Set template to treat (can be repeated).
+  -o, --option TEXT         Set builder configuration value (can be repeated).
+  --help                    Show this message and exit.
+
+Commands:
+  package     Package CLI
+  template    Template CLI
+  repository  Repository CLI
+  installer   Installer CLI
+  config      Config CLI
+  cleanup     Cleanup CLI
+  list-deps   List build dependencies
+  self        Self-management CLI (upgrade qubes-builderv2 in place)
+
+Stages:
+    fetch prep build post verify sign publish upload
+
+Option:
+    Input value for option is of the form:
+
+        1. key=value
+        2. parent-key:key=value
+        3. key+value
+
+    It allows to set configuration dict values or appending array values.
+    In the three forms, 'value' can be chained by one of the three forms to
+    set value at deeper level.
+
+    For example:
+        force-fetch=true
+        executor:type=qubes
+        executor:options:dispvm=builder-dvm
+        components+lvm2
+        components+kernel:branch=stable-5.15
+
+Remark:
+    The Qubes OS components are separated into two groups: standard components
+    and template components. Standard components will produce distribution
+    packages to be installed in TemplateVMs or StandaloneVMs, while template
+    components will produce template packages to be installed via qvm-template.
+```
+
+You can use the provided `qubes-os-r4.2.yml` configuration file
+under `example-configs` named `builder.yml` in the root of `qubes-builderv2`
+(like the legacy `qubes-builder`).
+
+> Remark: You can find official configuration files used to build packages and templates at https://github.com/QubesOS/qubes-release-configs.
+
+Artifacts can be found under `artifacts` directory:
+
+```
+artifacts/
+├── components          <- Stage artifacts for each component version and distribution.
+├── distfiles           <- Extra source files.
+├── repository          <- Qubes local builder repository (metadata are generated each time inside cages).
+├── repository-publish  <- Qubes OS repositories that are uploaded to {yum,deb,...}.qubes-os.org.
+├── sources             <- Qubes components source.
+└── templates           <- Template artifacts.
+```
+
+### Package
+
+Build components:
+
+```bash
+$ ./qb package build
+```
+
+This automatically runs `fetch`, `init-cache`, and `prep` first as needed.
+You can also call stages explicitly:
+
+```bash
+$ ./qb package fetch prep build
+```
+
+Sign and publish:
+
+```bash
+$ ./qb package sign publish
+```
+
+Run all stages in one go:
+
+```bash
+$ ./qb package all
+```
+
+Initialize the chroot cache (Mock, pbuilder) explicitly:
+
+```bash
+$ ./qb package init-cache
+```
+
+`init-cache` is not part of `all` --- it runs automatically as a dependency
+of `prep` and `build` when needed.
+
+To inspect what would run without executing anything:
+
+```bash
+$ ./qb package pipeline build
+$ ./qb package pipeline --format yaml upload
+$ ./qb package pipeline --no-deps sign   # show only the requested stage
+```
+
+
+### List-deps
+
+The `list-deps` command reads the build dependencies declared in each
+component's packaging files (spec, control, PKGBUILD) and produces a
+`cache` YAML block ready to paste into `builder.yml`. No chroot is needed:
+the extraction runs against the rendered source files inside a container.
+
+**Run the stage and print the result:**
+
+```bash
+$ ./qb -c core-vchan-xen -d host-fc41 -d vm-bookworm list-deps run
+```
+
+This runs the `list-deps` stage for the given components and distributions,
+then prints the aggregated `cache` block to stdout:
+
+```yaml
+cache:
+  host-fc41:
+    packages:
+    - gcc
+    - xen-devel >= 4.2
+  vm-bookworm:
+    packages:
+    - debhelper
+    - libxen-dev
+```
+
+**Print from existing artifacts (no stage run):**
+
+```bash
+$ ./qb list-deps show
+```
+
+This reads already-produced `list-deps` artifacts and prints the same YAML
+without running the stage again.
+
+**Merge into `builder.yml` in-place:**
+
+```bash
+$ ./qb list-deps update builder.yml
+```
+
+This merges the collected packages into the `cache` section of the given
+file. Existing entries are preserved and new ones are added. A `.bak` backup
+is written before the file is rewritten. Note that PyYAML rewrites the file,
+so comments and original formatting are lost.
+
+**Skip the git fetch when sources are already present:**
+
+By default, `list-deps run` fetches sources first. To skip that step:
+
+```bash
+$ ./qb -o skip-git-fetch=true list-deps run
+```
+
+If the source hash has not changed since the last run, the stage is skipped
+automatically and the cached result is used.
+
+**Exclude packages by name pattern:**
+
+By default, `qubes-*` packages are dropped from the output because they are
+built by the pipeline itself and cannot be pre-installed from upstream repos.
+Override the default in `builder.yml`:
+
+```yaml
+list-deps:
+  exclude:
+    - '^qubes-'
+    - '^xen-'
+```
+
+Set `exclude: []` to disable filtering. Patterns are Python regexes matched
+against the package name (without the version constraint). The CLI exposes a
+repeatable `--exclude` flag that appends to whatever is configured:
+
+```bash
+$ ./qb list-deps show --exclude '^xen-' --exclude '^perl-'
+```
+
+**Per-distribution caveats:**
+
+- **DEB**: `debian-parser` strips version constraints from `Build-Depends`,
+  so the cache always contains bare names (e.g. `python3-foo`, never
+  `python3-foo >= 1.2`). RPM and Arch keep `NAME OP VERSION` forms.
+- **RPM virtual provides**: dependencies like `pkgconfig(systemd)` or
+  `perl(File::Find)` are dropped by the safety filter (parentheses are
+  blocked to prevent shell injection). Anything satisfied only by
+  a virtual provide will not be pre-installed via
+  `cache.<dist>.packages`.
+
+### Self-upgrade
+
+`qb self upgrade` fast-forwards the running qubes-builderv2 checkout in
+place by running the same fetch + signature-verification logic that is used
+for every other component. It is the only supported way to update
+qubes-builderv2 from `qb`.
+
+```bash
+$ ./qb self upgrade
+```
+
+This is a separate, non-chainable subcommand: it always runs on its own. Re-run
+`qb` afterwards so the freshly fetched code is loaded.
+
+- A dirty working tree blocks the upgrade. Commit or stash your changes first
+  (the merge is `--ff-only`, so real conflicts still fail).
+- The `artifacts/` directory is never touched.
+
+Configure in `builder.yml`:
+
+```yaml
+self-upgrade:
+  url: https://github.com/QubesOS/qubes-builderv2
+  branch: main
+  # maintainers: inherited from git.maintainers if omitted
+  # min-distinct-maintainers: 1    # distinct maintainer signatures required
+  # verification-mode: signed-tag | less-secure-signed-commits-sufficient | insecure-skip-checking
+  # check-for-updates: true        # automatic notice on build commands
+  # check-interval: 86400          # seconds between remote checks (once a day)
+```
+
+If `self-upgrade` is omitted, defaults are:
+- URL `https://github.com/QubesOS/qubes-builderv2`,
+- the current git branch when it exists on the remote and `main` otherwise,
+- maintainers taken from `git.maintainers`, `verification-mode: signed-tag`.
+
+An explicitly configured `branch` is used as-is (no fallback). Verification
+works like a component fetch: the commit or tag must be signed by a key listed
+in `maintainers` (inherited from `git.maintainers`), and nothing is trusted just
+for being bundled. Key files are looked up as `{KEYID}.asc` in the configured
+`key-dirs` and in the keys shipped under `qubesbuilder/plugins/fetch/keys/`.
+
+Branch handling:
+
+- The upgraded branch is your current branch when it exists on the remote,
+  otherwise `main`. An explicit `self-upgrade.branch` is never overridden.
+- When you upgrade from a different branch than the upgraded one (e.g. a dev
+  branch), `qb self upgrade` advances the target branch (e.g. local `main`)
+  and checks your original branch back out. Your branch is left untouched.
+  Merge or rebase it onto the updated branch yourself.
+
+#### Update notifications
+
+Build subcommands (`package`, `template`, `installer`) print a one-line notice
+at the end of the run when a newer qubes-builderv2 is available on the
+configured branch (at the end so it is not lost in the build output):
+
+- Queried with `git ls-remote` (no fetch) at most once per `check-interval`
+  (default daily). The last check is recorded in `artifacts/self-upgrade-check.json`.
+- *Available* means the remote tip is not yet in the history of the matching
+  local branch (e.g. local `main`), not the checked-out HEAD, so a divergent
+  dev branch does not fail the result. Local commits on top do not cause a
+  false notice.
+- No signatures are checked for the notice. An unsigned or badly signed commit
+  still shows, but `qb self upgrade` refuses to apply it.
+
+Disable with `self-upgrade.check-for-updates: false`, or per-invocation with
+`QUBES_BUILDER_NO_UPDATE_CHECK=1` (handy in CI).
+
+Check on demand (ignores the throttle, never modifies the checkout):
+
+```bash
+$ ./qb self check
+```
+
+### Template
+
+Similarly, you can start building the templates defined in this development
+configuration with:
+
+```bash
+$ ./qb template all
+```
+
+
+### Installer
+
+The build of an ISO is done in several steps. First, it downloads necessary packages
+for Anaconda that will be used for Qubes OS installation. Second, it does the same
+for Lorax, that is responsible to create the installation runtime. Finally, the step
+of creating the ISO is done without network and uses only the downloaded packages.
+Download steps are done inside a cage and creating the ISO is done inside a Mock chroot
+itself inside a cage. As the ISO creation is done offline, it is important to create
+a cache first for Mock. To perform all these simply do:
+
+```bash
+$ ./qb installer init-cache all
+```
+
+The builder supports only one host distribution at a time. If multiple
+is provided in configuration file (e.g. for development purpose), simply call
+the builder with the wanted host distribution associated to the ISO.
+
+
+### Repository
+
+In order to publish to a specific repository, or if you ignored the publish
+stage, you can use the `repository` command to create a local repository that
+is usable by distributions. For example, to publish only the
+`whonix-gateway-16` template:
+
+```bash
+./qb -t whonix-gateway-16 repository publish templates-community-testing
+```
+
+Or publish all the templates provided in `builder.yml` in
+`templates-itl-testing`:
+
+```bash
+./qb repository publish templates-itl-testing
+```
+
+Similar commands are available for packages, for example:
+
+```bash
+./qb -d host-fc41 -c core-qrexec repository publish current-testing
+```
+
+and
+
+```bash
+./qb repository publish unstable
+```
+
+It is not possible to publish packages in template repositories or vice versa.
+In particular, you cannot publish packages in the template repositories
+`templates-itl`, `templates-itl-testing`, `templates-community`, or
+`templates-community-testing`; and you cannot publish templates in the package
+repositories `current`, `current-testing`, `security-testing`, or `unstable`. A
+built-in filter enforces this behavior.
+
+Normally, everything published in a stable repository, like `current`,
+`templates-itl`, or `templates-community`, should first wait in a testing
+repository for a minimum of five days. For exceptions in which skipping the
+testing period is warranted, you can ignore this rule by using the
+`--ignore-min-age` option with the `publish` command.
+
+Please note that the `publish` plugin will not allow publishing to a stable
+repository. This is only possible with the `repository` command.
+
+
+## Signing with Split GPG
+
+If you plan to sign packages with [Split
+GPG](https://www.qubes-os.org/doc/split-gpg/), add the following to your
+`~/.rpmmacros`:
+
+```
+%__gpg /usr/bin/qubes-gpg-client-wrapper
+
+%__gpg_check_password_cmd   %{__gpg} \
+        gpg --batch --no-verbose -u "%{_gpg_name}" -s
+
+%__gpg_sign_cmd /bin/sh sh -c '/usr/bin/qubes-gpg-client-wrapper \\\
+        --batch --no-verbose \\\
+        %{?_gpg_digest_algo:--digest-algo %{_gpg_digest_algo}} \\\
+        -u "%{_gpg_name}" -sb %{__plaintext_filename} >%{__signature_filename}'
+```
+
+
+## .qubesbuilder
+
+The `.qubesbuilder` file is a YAML file placed inside a Qubes OS source
+component directory, similar to `Makefile.builder` for the legacy Qubes
+Builder. It has the following top-level keys:
+
+```
+  PACKAGE_SET
+  PACKAGE_SET-DISTRIBUTION_NAME (= Qubes OS distribution like `host-fc42` or `vm-trixie`)
+  PLUGIN_ENTRY_POINTS (= Keys providing content to be processed by plugins)
+```
+
+We provide the following list of available keys:
+
+- `host` --- `host` package set content.
+- `vm` --- `vm` package set content.
+- `rpm` --- RPM plugins content.
+- `deb` --- Debian plugins content.
+- `windows` --- Windows plugin content.
+- `source` --- Fetch and source plugins (`fetch`, `source`, `source_rpm`,
+  `source_deb` and `source_windows`) content.
+- `build` --- Build plugins content (`build`, `build_rpm`, `build_deb` and `build_windows`).
+- `create-archive` --- Create source component directory archive (default:
+  `True` unless `files` is provided and not empty).
+- `commands` --- Execute commands before plugin or distribution tools
+  (`source_deb` only).
+- `modules` --- Declare submodules to be included inside source preparation
+  (source archives creation and placeholders substitution)
+- `files` --- List of external files to be downloaded. It has to be provided
+  with the combination of a `url`/`git-url` and a verification method. For
+  `url`, a verification method is either a checksum file or a signature file
+  with public GPG keys. For `git-url`, it's either GPG key to verity a tag, or
+  explicit commit id.
+- `url` --- URL of the external file to download.
+- `sha256` --- Path to `sha256` checksum file relative to source directory (in
+  combination with `url`).
+- `sha512` --- Path to `sha256` checksum file relative to source directory (in
+  combination with `url`).
+- `signature` --- URL of the signature file of downloaded external file (in
+  combination with `url` and `pubkeys`).
+- `uncompress` --- Uncompress external file downloaded before verification.
+  In case of tarball created from git, do not compress it.
+- `pubkeys` --- List of public GPG keys to use for verifying the downloaded
+  signature file (in combination with `url` and `signature`).
+- `git-url` --- URL of a repository to fetch and create a tarball from.
+- `tag` --- Specific tag to fetch from `git-url` and verify with a key
+  specified in `pubkeys`.  Can use `@VERSION@` placeholder.
+- `commit-id` --- Specific pre-verified commit to fetch from `git-url`. No
+  extra verification is performed.
+- `git-basename` --- Specify basename for archive created out of git
+  repository. This is also used for the top level directory inside the archive.
+  If not set, final component of the `git-url` (minus `.git` if applicable),
+  plus a commit id or tag will be used.
+
+Here is a non-exhaustive list of distribution-specific keys:
+- `host-fc41` --- Fedora 41 for the `host` package set content only
+- `vm-bullseye` --- Bullseye for the `vm` package set only
+
+`build_windows` specific: all output artifacts for a component need to be specified in
+`.qubesbuilder` as lists of paths (relative to component root) with the following keys:
+- `bin` --- binaries (`.exe`, `.dll`, `.sys` and all files that can be PE-signed)
+- `inc` --- devel header files that are dependencies for other components
+- `lib` --- linker libraries that are dependencies for other components
+
+`skip-test-sign` option can be specified to provide a list of binaries that should not be
+signed with a test key (only used for the final installer binary currently, since
+the self-signed certificate is in the installer itself so the binary can't be verified
+if test-signed).
+
+Inside each top level, it defines what plugin entry points like `rpm`, `deb`,
+and `source` will take as input. Having both `PACKAGE_SET` and
+`PACKAGE_SET-DISTRIBUTION_NAME` with common keys means that it is up to the
+plugin to know in which order to use or consider them. It allows for defining
+general or distro-specific options.
+
+In a `.qubesbuilder` file, there exist several placeholder values that are
+replaced when loading `.qubesbuilder` content. Here is the list of
+currently-supported placeholders:
+
+- `@COMPONENT@` --- Replaced by component name
+- `@VERSION@` --- Replaced by component version (provided by the `version` file
+  inside the component source directory)
+- `@REL@` --- Replaced by component release (provided by the `rel` file inside
+  the component source directory, if it exists)
+- `@VERREL@` --- Replaced by component version and release as `<VERSION>-<RELEASE>`
+- `@BUILDER_DIR@` --- Replaced by `/builder` (inside a cage)
+- `@BUILD_DIR@` --- Replaced by `/builder/build`  (inside a cage)
+- `@PLUGINS_DIR@` --- Replaced by `/builder/plugins`  (inside a cage)
+- `@DISTFILES_DIR@` --- Replaced by `/builder/distfiles`  (inside a cage)
+- `@DEPENDENCIES_DIR@` --- Replaced by `/builder/dependencies` (inside a cage)
+- `@SOURCE_DIR@` --- Replaced by `/builder/<COMPONENT_NAME>` (inside a cage
+  where, `<COMPONENT_NAME>` is the component directory name)
+- `@CONFIGURATION@` --- `build_windows` specific, replaced by the project configuration
+  (`Debug` / `Release`)
+
+
+### Examples
+
+Here is an example for `qubes-python-qasync`:
+```yaml
+host:
+  rpm:
+    build:
+    - python-qasync.spec
+vm:
+  rpm:
+    build:
+    - python-qasync.spec
+vm-buster:
+  deb:
+    build:
+    - debian
+vm-bullseye:
+  deb:
+    build:
+    - debian
+source:
+  files:
+  - url: https://files.pythonhosted.org/packages/source/q/qasync/qasync-0.9.4.tar.gz
+    sha256: qasync-0.9.4.tar.gz.sha256
+```
+
+It defines builds for the `host` and `vm` package sets for all supported RPM
+distributions, like Fedora, CentOS Stream, and soon openSUSE with the `rpm`
+level key. This key instructs RPM plugins to take as input provided spec files
+in the `build` key. For Debian-related distributions, only the `buster` and
+`bullseye` distributions have builds defined with the level key `deb`. Similar
+to RPM, it instructs Debian plugins to take as input directories provided in
+the `build` key.
+
+In the case where `deb` would have been defined also in `vm` like:
+
+```yaml
+(...)
+vm:
+  rpm:
+    build:
+    - python-qasync.spec
+  deb:
+    build:
+      - debian1
+      - debian2
+vm-buster:
+  deb:
+    build:
+    - debian
+(...)
+```
+
+The `vm-buster` content overrides the general content defined by `deb` in `vm`,
+so for the `buster` distribution, we would still build only for the `debian`
+directory.
+
+In this example, the top level key `source` instructs plugins responsible for
+fetching and preparing the component source to consider the key `files`. It is
+an array, here only one dict element, for downloading the file at the given
+`url` and verifying it against its `sha256` sum. The checksum file is relative
+to the component source directory.
+
+If no external source files are needed, like an internal Qubes OS component
+`qubes-core-qrexec`,
+
+```yaml
+host:
+  rpm:
+    build:
+    - rpm_spec/qubes-qrexec.spec
+    - rpm_spec/qubes-qrexec-dom0.spec
+vm:
+  rpm:
+    build:
+    - rpm_spec/qubes-qrexec.spec
+    - rpm_spec/qubes-qrexec-vm.spec
+  deb:
+    build:
+    - debian
+  archlinux:
+    build:
+    - archlinux
+```
+
+we would have no `source` key instructing to perform something else other than
+standard source preparation steps and creation (SRPM, dsc file, etc.). In this
+case, we have globally-defined builds for RPM, Debian-related distributions,
+and ArchLinux (`archlinux` key providing directories as input similar to
+Debian).
+
+Some components need more source preparation and processes like
+`qubes-linux-kernel`:
+
+```yaml
+host:
+  rpm:
+    build:
+    - kernel.spec
+source:
+  modules:
+  - linux-utils
+  - dummy-psu
+  - dummy-backlight
+  files:
+  - url: https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-@VERSION@.tar.xz
+    signature: https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-@VERSION@.tar.sign
+    uncompress: true
+    pubkeys:
+    - kernel.org-2-key.asc
+    - kernel.org-1-key.asc
+  - url: https://github.com/PatrickVerner/macbook12-spi-driver/archive/2905d318d1a3ee1a227052490bf20eddef2592f9.tar.gz#/macbook12-spi-driver-2905d318d1a3ee1a227052490bf20eddef2592f9.tar.gz
+    uncompress: true
+    sha256: macbook12-spi-driver-2905d318d1a3ee1a227052490bf20eddef2592f9.tar.sha256
+```
+
+First, the `source` key provides `modules` that instructs the `fetch` and
+`source` plugins that there exist `git` submodules that are needed for builds.
+In the case of RPM, the spec file has different `Source` macros depending on
+archives with submodule content. The source preparation will create an archive
+for each submodule and render the spec file according to the submodule archive
+names. More precisely, for `qubes-linux-kernel` commit hash
+`b4fdd8cebf77c7d0ecee8c93bfd980a019d81e39`, it will replace placeholders inside
+the spec file `@linux-utils@`, `@dummy-psu@`, and `@dummy-backlight@` with
+`linux-utils-97271ba.tar.gz`, `dummy-psu-97271ba.tar.gz`, and
+`dummy-backlight-3342093.tar.gz`  respectively, where `97271ba`, `97271ba`, and
+`3342093` are short commit hash IDs of submodules.
+
+Second, in the `files` key, there is another case where an external file is
+needed but the component source directory holds only public keys associated
+with archive signatures and not checksums. In that case, `url` and `signature`
+are files to be downloaded and `pubkeys` are public keys to be used for source
+file verification. Moreover, sometimes the signature file contains the
+signature of an uncompressed file. The `uncompress` key instructs `fetch`
+plugins to uncompress the archive before proceeding to verification.
+
+**Reminder:** These operations are performed inside several cages. For example,
+the download is done in one cage, and the verification is done in another cage.
+This allows for separating processes that may interfere with each other,
+whether intentionally or not.
+
+For an internal Qubes OS component like `qubes-core-qrexec`, the `source`
+plugin handles creating a source archive that will be put side to the packaging
+files (spec file, Debian directory, etc.) to build packages. For an external
+Qubes OS component like `qubes-python-qasync` (same for `xen`, `linux`,
+`grub2`, etc.), it uses the external file downloaded (and verified) side to the
+packaging files to build packages. Indeed, the original source component is
+provided by the archive downloaded and only packaging files are inside the
+Qubes source directory. Packaging includes additional content like patches,
+configuration files, etc. In very rare cases, the packaging needs both a source
+archive of the Qubes OS component directory and external files. This is the
+case `qubes-vmm-xen-stubdom-linux`:
+
+```yaml
+host:
+  rpm:
+    build:
+    - rpm_spec/xen-hvm-stubdom-linux.spec
+source:
+  create-archive: true
+  files:
+  - url: https://download.qemu.org/qemu-6.1.0.tar.xz
+    signature: https://download.qemu.org/qemu-6.1.0.tar.xz.sig
+    pubkeys:
+    - keys/qemu/mdroth.asc
+    - keys/qemu/pbonzini.asc
+  - url: https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-5.10.105.tar.xz
+    signature: https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-5.10.105.tar.sign
+    uncompress: true
+    pubkeys:
+    - keys/linux/greg.asc
+  - url: https://busybox.net/downloads/busybox-1.31.1.tar.bz2
+    signature: https://busybox.net/downloads/busybox-1.31.1.tar.bz2.sig
+    pubkeys:
+    - keys/busybox/vda_pubkey.asc
+  - url: https://freedesktop.org/software/pulseaudio/releases/pulseaudio-14.2.tar.xz
+    sha512: checksums/pulseaudio-14.2.tar.xz.sha512
+  - url: https://github.com/libusb/libusb/releases/download/v1.0.23/libusb-1.0.23.tar.bz2
+    sha512: checksums/libusb-1.0.23.tar.bz2.sha512
+```
+
+By default, if files are provided, plugins treat components as external Qubes
+OS components, which means that archiving the component source directory is not
+performed, because it's useless to package the packaging itself. For this
+particular component in Qubes OS, there are several directories needed from
+source component directories. Consequently, the packaging has been made in such
+a way so as to extract from the source archive only these needed directories.
+In order to force archive creation, (or disable it), the `create-archive`
+boolean can be set in the `source` keys at the desired value, here `true`.
+
+For Debian distributions, it is sometimes necessary to execute a custom command
+before source preparation. This is the case, for example, for `i3`:
+
+```yaml
+host:
+  rpm:
+    build:
+    - i3.spec
+vm:
+  rpm:
+    build:
+    - i3.spec
+  deb:
+    build:
+    - debian-pkg/debian
+    source:
+      commands:
+      - '@PLUGINS_DIR@/source_deb/scripts/debian-quilt @SOURCE_DIR@/series-debian.conf @BUILD_DIR@/debian/patches'
+source:
+  files:
+  - url: https://i3wm.org/downloads/i3-4.18.2.tar.bz2
+    sha512: i3-4.18.2.tar.bz2.sha512
+```
+
+Inside the `deb` key, there is a command inside the `commands` array to execute
+the `debian-quilt` script provided by the `source_deb` plugin with a series of
+patch files located in the source directory (path inside a cage) to the
+prepared source directory, here the build directory (path inside a cage).
+
+**Note:** All commands provided are executed before any plugin tools or
+distribution tools like `dpkg-*`. This is only available for Debian
+distributions and not RPM distributions, as similar processing is currently not
+needed.
+
+Here is an example for a Windows component (`core-vchan-xen`):
+
+```yaml
+host:
+  rpm:
+    build:
+    - rpm_spec/libvchan.spec
+vm:
+  rpm:
+    build:
+    - rpm_spec/libvchan.spec
+(...)
+  windows:
+    build:
+    - windows/vs2022/core-vchan-xen.sln
+    bin:
+    - windows/vs2022/x64/@CONFIGURATION@/libvchan/libvchan.dll
+    inc:
+    - windows/include/libvchan.h
+    lib:
+    - windows/vs2022/x64/@CONFIGURATION@/libvchan/libvchan.lib
+```
+
+The `build` stage specifies a Visual Studio solution to be built. `bin`, `inc` and `lib` keys
+specify output artifacts.
+
+## Qubes builder configuration
+
+Options available in `builder.yml`:
+
+- `git`:
+  - `baseurl: str` --- Base url of git repos (default: https://github.com).
+  - `prefix: str` --- Which repository to clone (default: QubesOS/qubes-).
+  - `suffix: str` --- git suffix (default: .git).
+  - `branch: str` --- git branch (default: main).
+  - `maintainers: List[str]` --- List of extra fingerprint allowed for signature verification of git commit and tag. See `key-dirs` option for providing the public keys.
+
+- `skip-git-fetch: bool` --- When set, do not update already downloaded git repositories (those in `sources` artifacts dir). New components are still fetched (once). Useful when doing development builds from non-default branches, local modifications etc. The default is `True`.
+
+- `skip-files-fetch: bool` --- When set, do not fetch component files like source tarballs (those in the `distfiles` artifacts dir). Component builds *will fail* without those files. Useful to save time and space when fetching git repositories.
+
+- `increment-devel-versions: bool`  --- When set, each package built will have local build number appended to package release number. This way, it's easy to update test environment without manually forcing reinstall of packages with unchanged versions. Example versions with devel build number:
+
+  - `qubes-core-dom0-4.2.12-1.13.fc37.x86_64` (`.13` is the additional version here)
+  - `qubes-u2f_2.0.1+deb11u1+devel2_all.deb` (`+devel2` is the additional version here)
+
+- `artifacts-dir: str` --- Path to artifacts directory.
+
+- `plugins-dirs: List[str]` --- List of path to plugin directory. By default, the local plugins directory is prepended to the list.
+
+- `backend-vmm: str` --- Backend Virtual Machine (default and only supported value: xen).
+
+- `debug: bool` --- Print full traceback on exception (default: False).
+
+- `verbose: bool` --- Increase log verbosity (default: False).
+
+- `qubes-release: str` --- Qubes OS release e.g. r4.2.
+
+- `min-age-days: int` --- Minimum days for testing component or template allowed to reach stable repositories (default: 5).
+
+- `gpg-client: str`: GPG client to use, either `gpg` or `qubes-gpg-client-wrapper`.
+
+- `key-dirs: List[str]`: additional directories with maintainer's keys; keys needs to be named after full fingerprint plus `.asc` extension
+
+- `template-root-size: str` --- Template root size as an integer and optional unit (example: 10K is 10*1024).  Units are K,M,G,T,P,E,Z,Y (powers of 1024) or KB,MB,... (powers of 1000). Binary prefixes can be used, too: KiB=K, MiB=M, and so on.
+
+- `iso: Dict`:
+  - `kickstart: str` --- Image installer kickstart. The path usually points at a file in `artifacts/sources/qubes-release`, in a `conf/` directory - example value: `conf/iso-online-testing.ks`. To use path outside of that directory, either set absolute path, or a path starting with `./` (path relative to builder configuration file). Into the kickstart file, it can include other kickstart files using `%include` but it is limited to include existing kickstart files inside `qubes-release/conf`.
+  - `comps: str` --- Image installer groups (comps) file. The path usually points at a file in `artifacts/sources/qubes-release`, in a `comps/` directory - example value: `comps/comps-dom0.xml`. To use path outside of that directory, either set absolute path, or a path starting with `./` (path relative to builder configuration file).
+  - `flavor: str` --- Image name will be named as `Qubes-<iso-version>-<iso-flavor>-<arch>.iso`.
+  - `use-kernel-latest: bool` --- If True, use `kernel-latest` when building installer runtime and superseed `kernel` in the installation. It allows to boot installer and QubesOS with the latest drivers provided by stable kernels and not only long term supported ones by default.
+  - `version: str` --- Define specific version to embed, by default current date is used.
+  - `is-final: bool` --- Should the ISO be marked as "final" (skip showing warning about development build at the start of the installation).
+
+- `use-qubes-repo: Dict`:
+  `version: str` --- Use Qubes packages repository to satisfy build dependents. Set to target version of Qubes you are building packages for (like "4.1", "4.2" etc.).
+  `testing: bool` --- When used with `use-qubes-repo:version`, enable testing repository for that version (in addition to stable).
+
+- `sign-key: Dict` --- Fingerprint for signing content.
+  - `rpm: str` --- RPM content.
+  - `deb: str` --- Debian content.
+  - `archlinux: str` --- Archlinux content.
+  - `iso: str` --- ISO content.
+  - `windows: str` --- Windows content.
+
+- `less-secure-signed-commits-sufficient: list` --- List of component names where signed commits is allowed instead of requiring signed tags. This is less secure because only commits that have been reviewed are tagged.
+
+- `timeout: int`: Abort build after given timeout, in seconds.
+
+- `repository-publish: Dict` ---  Testing repository to use at publish stage.
+  - `components: str` --- Components . This is either `current-testing`, `security-testing` or `unstable`.
+  - `templates: str` --- Testing repository for templates at publish stage. This is either `templates-itl-testing` or `templates-community-testing`.
+
+- `executor: Dict` --- Specify default executor to use.
+  - `type: str` --- Executor type: qubes, docker, podman, local or windows.
+  - `options: Dict`:
+    - `image: str` --- Container image to use. Specific to docker or podman type.
+    - `dispvm: str` --- Disposable template VM to use (use `"@dispvm"` to use the calling qube `default_dispvm` property or specify a name).
+    - `directory: str` --- Base directory for local executor to create temporary directories.
+    - `clean: bool` --- Clean container, disposable qube or temporary local folder (default `true`).
+    - `clean-on-error: bool` --- Clean container, disposable qube or temporary local folder if any error occurred. Default is value set by `clean`.
+
+- Options specific to the `windows` and `windows-ssh` executors (see `example-configs/windows-tools.yml`):
+  - `user: str` --- Name of the user account in the worker Windows machine/VM (default: `user`).
+  - `threads: int` --- Number of parallel threads to use for MSBuild (default: 1).
+  - `ewdk: str` --- Path to the EWDK iso file. For the `windows` executor: always attached as a Qubes block device to the disposable VM. For `windows-ssh`: behaviour is controlled by `ewdk-mode` (see below).
+
+- Options specific to the `windows` executor:
+  - `dispvm: str` --- Name of the disposable Windows template (default: `win-build`).
+
+- Options specific to the `windows-ssh` executor:
+  - `ssh-key-path: str` --- Path to the private ssh key used for communication with the worker machine (default: `~/.ssh/win-build.key`).
+  - `ssh-ip: str` --- IP address to use when connecting to the worker machine.
+  - `ssh-vm: str` --- Name of the worker qube (optional). If set, the target is treated as a Qubes HVM: the qube is started automatically before connecting and `ewdk-mode` controls how the EWDK is provided. Without `ssh-vm`, the target is any SSH-reachable Windows machine (physical or otherwise) and the EWDK ISO is always SCPed to `c:\Users\<user>\ewdk.iso` and mounted via PowerShell.
+  - `ewdk-mode: str` --- Controls how the EWDK ISO is provided when `ssh-vm` is set (default: `attach`). Has no effect without `ssh-vm`.
+    - `attach`: attach the ISO as a Qubes block device to the worker qube before starting it (via `admin.vm.device.block.Attach`). Requires the builder to run inside Qubes with access to the Admin API. This is an error if `ssh-vm` is not set.
+    - `copy`: SCP the ISO to `c:\Users\<user>\ewdk.iso` inside the running VM and mount it via PowerShell. Use this when Qubes block-device attachment is not available, e.g. the builder is running outside a Qubes environment.
+  - `ewdk-skip-checksum: bool` --- When using SCP transfer (`ewdk-mode: copy` with `ssh-vm`, or no `ssh-vm`), skip SHA256 verification and only transfer the ISO if absent on the remote host (default: `false`).
+
+- `stages: List[str, Dict]` --- List of stages to trigger.
+  - `<stage_name>: str` --- Stage name.
+  - `<stage_name>: Dict` --- Stage name provided as dict to override executor to use.
+    - `executor: Dict` --- Specify executor to use for this stage.
+
+- `distributions: List[Union[str, Dict]]` --- Distribution for packages provided as <package-set>-<distribution>.<architecture>. Default architecture is `x86_64` and can be omitted. Some examples: host-fc32, host-fc42.ppc64 or vm-trixie.
+  - `<distribution_name>` --- Distribution name provided as string.
+  - `<distribution_name>`: --- Distribution name provided as dict to pass or override values.
+    - `stages: List[Dict]` --- Allow to override stages options.
+
+- `components: List[Union[str, Dict]]` -- List of components you want to build. See example configs for sensible lists. The order of components is important - it should reflect build dependencies, otherwise build would fail.
+  - `<component_name>` --- Component name provided as string.
+  - `<component_name>`: --- Component name provided as dict to pass or override values.
+    - `branch: str` --- override default git branch.
+    - `url: str` --- provide the full url of the component.
+    - `maintainers: List[str]` --- List of extra fingerprint allowed for signature verification of git commit and tag.
+    - `timeout: int` --- Abort build after given timeout, in seconds.
+    - `plugin: bool` --- Component being actually an extra plugin. No `.qubesbuilder` file is needed.
+    - `packages: bool` --- Component that generate packages (default: True). If set to False (e.g. `builder-rpm`), no `.qubesbuilder` file is allowed.
+    - `verification-mode: str` --- component source code verification mode, supported values are: `signed-tag` (this is default), `less-secure-signed-commits-sufficient`, `insecure-skip-checking`. This option takes precedence over top level `less-secure-signed-commits-sufficient`.
+    - `stages: List[Dict]` --- Allow to override stages options.
+    - `distribution_name: List[Dict]` -- Allow to override per distribution, stages options or to provides dependencies.
+    - `package_set: List[Dict]` -- Allow to override per distribution package set, stages options.
+
+- `templates: List[Dict]` -- List of templates you want to build. See example configs for sensible lists.
+  - `<template_name>`: --- Template name.
+    - `dist: str` --- Underlying distribution, e.g. fc42, bullseye, etc.
+    - `flavor: str` --- If applies, specify template flavor, e.g. minimal, xfce, whonix-gateway, whonix-workstation, etc.
+    - `options: List[str]` --- Provides template build options, e.g. minimal, no-recommends, firmware, etc.
+
+- `repository-upload-remote-host: Dict` --- Rsync URL for uploading local repository content.
+  - `rpm: str` --- RPM content.
+  - `deb: str` --- Debian content.
+  - `iso: str` --- ISO content.
+  - `windows: str` --- Windows content.
+
+- `cache: Dict` --- List of distributions cache options.
+  - `<distribution_name>: Dict` --- Distribution name provided as in `distributions`.
+    - `packages: List[str]` --- List of packages to pre-populate in the chroot cache. By default they are downloaded but not installed into the base chroot. Use `install-packages: true` to install them directly.
+    - `install-packages: bool` --- When `true`, the packages listed in `packages` are installed into the base chroot at `init-cache` time, so every subsequent build starts with them already present. When `false` (default), they are only downloaded into the package manager cache. Toggling this flag forces the chroot to be rebuilt. The behaviour differs slightly per distribution:
+      - RPM (Mock): the post-install chroot root is re-archived into `root_cache/cache.tar.gz` so future `--no-clean` builds restore the installed state.
+      - Debian (pbuilder): `pbuilder update --extrapackages` installs the packages into `base.tgz`.
+      - Arch Linux: `mkarchroot` always installs packages into the chroot; the flag is accepted for consistency and to invalidate the cache on toggle.
+  - `templates: List[str]` --- List of template names to download and put in installer cache. They are available based on what is defined in selected kickstart.
+
+- `automatic-upload-on-publish: bool` --- Automatic upload on publish/unpublish.
+
+- `mirrors: Dict` --- List of distributions mirrors where key refers to <package-set>-<distribution> or <distribution>. The former overrides the latter.
+  `<distribution_name | distribution>: List[str]` --- List of mirrors to be used in builder plugins.
+
+> Remark: `mirrors` support is partially implemented for now. It supports ArchLinux and Debian for template build only.
+> With respect to legacy builder, it allows to provide values for `ARCHLINUX_MIRROR` and `DEBIAN_MIRRORS`.
+
+- `git-run-inplace: bool` --- Run `git` directly on local sources available on the host when calling `fetch` stage for components. It overrides the defined executor for `fetch` stage by a local executor in order to call `git` directly into sources artifacts directory.
+
+### Fine-grained control of executors
+To enable a more detailed control over executor options passed to stages, values are assigned and updated for the `stages` parameter according to the following order:
+1. The primary definition of `stages` at the top level,
+2. Definitions within the context of `distributions`,
+3. The inclusion of `stages` within `components`,
+4. The specification of `stages` within a particular package set in `components`,
+5. The delineation of `stages` within a specific distribution in `components`.
+
+Assuming part of builder configuration file looks like:
+```yaml
+executor:
+  type: qubes
+  options:
+    dispvm: "@dispvm"
+    clean: False
+
+distributions:
+  - vm-fc42
+  - vm-jammy:
+      stages:
+        - build:
+            executor:
+              options:
+                dispvm: qubes-builder-debian-dvm
+
+stages:
+  - fetch
+  - sign:
+      executor:
+        type: local
+
+components:
+- linux-kernel:
+    stages:
+      - sign:
+          executor:
+            type: qubes
+            options:
+              dispvm: signing-access-dvm
+    vm-jammy:
+      stages:
+        - prep:
+            executor:
+              type: local
+              options:
+                directory: /some/path
+    vm:
+      stages:
+        - build:
+            executor:
+              type: podman
+              options:
+                image: fedoraimg
+```
+
+For the `fetch` stage, the Qubes executor with disposable template `qubes-builder-debian-dvm` will be used for both `vm-fc42` and `vm-jammy`.
+For the `build` stage of `vm-fc42`, the Podman executor with container image `fedoraimg` will be used.
+For the `sign` stage, the Qubes executor with disposable template `signing-access-dvm` will be used for both `vm-fc42` and `vm-jammy`
+For the `prep` stage of `vm-jammy`, the Local executor with base directory `/some/path` will be used.
+
+### Windows-specific build stage options
+
+Options related to Qubes Windows Tools can be specified under the `build` stage of a Windows distribution, like this:
+
+```yaml
+distributions:
+  - vm-win10:
+      stages:
+        - build:
+            configuration: release
+            sign-qube: vault-sign
+            sign-key-name: "Qubes Windows Tools"
+            test-sign: true
+            executor:
+              type: windows # or windows-ssh
+              options:
+                user: user
+                threads: 1
+                dispvm: win-build
+                ewdk: "dev:loop1"
+                #ssh-key-path: /home/user/.ssh/win-build.key
+                #ssh-ip: 10.137.0.20
+```
+
+  - `configuration: str` --- build configuration (`debug` / `release`) (default: `release`).
+  - `sign-qube: str` --- name of the vault qube performing code signing, see the Windows executor description above.
+  - `sign-key-name: str` --- name of the signing key to use. For test keys this becomes the subject of the self-signed certificate.
+  - `test-sign: bool` --- code signing type, `true` (default) or `false`. Test signing generates ephemeral self-signed
+    keys for each component. Production signing uses an already existing key signed by a public CA (TODO: HSM).
+
+### Windows publish
+
+Windows artifacts are published by the `publish_windows` plugin.
+Unlike RPM and Debian packages, Windows components use Authenticode signing during the `build` stage rather than GPG, so the standard `sign-key` check is bypassed.
+
+**Stages**
+
+The `sign` stage for Windows is a no-op: Authenticode signing is done during `build`. It must still be run before `publish` because it creates the sign artifact info files that downstream stages depend on. The typical command sequence is:
+
+```bash
+./qb -d vm-win10 package build sign publish
+```
+
+**Configuration**
+
+Publishing requires `repository-publish: components` to be set in `builder.yml`:
+
+```yaml
+repository-publish:
+  components: current-testing
+```
+
+To upload published artifacts to a remote host, set `repository-upload-remote-host: windows`:
+
+```yaml
+repository-upload-remote-host:
+  windows: user@host:/path/to/windows/r4.2
+```
+
+To also GPG-sign the `SHA256SUMS` manifest, set the `sign-key: windows` fingerprint:
+
+```yaml
+sign-key:
+  windows: <GPG fingerprint>
+```
+
+**Published layout**
+
+Published artifacts are hardlinked from the build stage into a versioned directory tree under `repository-publish/`:
+
+```
+repository-publish/windows/<qubes-release>/<repository>/vm/<dist>/<component>_<version>/
+    bin/            # Authenticode-signed binaries (.exe, .dll, .sys, ...)
+    SHA256SUMS      # present only if sign-key: windows is configured
+    SHA256SUMS.asc  # GPG detached signature of SHA256SUMS
+```
+
+Only `bin/` files are published. Build-only artifacts (`inc/`, `lib/`) and the Authenticode certificate (`sign.crt`) remain in the build artifacts directory (`artifacts/components/`) and are not copied to `repository-publish/`.
+
+### Cross-distribution dependencies
+
+To use artifacts from other builds, you must declare dependencies using the `needs: List[Dict]` structure within the appropriate distribution stage.
+Each dependency is represented as a dictionary with the following keys:
+
+- `component: str` ---  The name of the component. This value is not limited to the top-level component reference; it can reference any available component.
+- `distribution: str` --- The name of the target distribution.
+- `stage: str` --- The stage name for which the dependency is required.
+- `build: str` --- The build reference as provided in a `.qubesbuilder` file.
+
+For example:
+
+```yaml
+components:
+  - installer-qubes-os-windows-tools:
+      host-fc41:
+        stages:
+          - prep:
+              needs:
+                - component: installer-qubes-os-windows-tools
+                  distribution: vm-win10
+                  stage: build
+                  build: vs2022/installer.sln
+                - component: installer-qubes-os-windows-tools
+                  distribution: vm-win10
+                  stage: sign
+                  build: vs2022/installer.sln
+```
+
+In this example, stage artifacts of `installer-qubes-os-windows-tools` for `vm-win10`, build referenced by `vs2022/installer.sln` and stages `build` and `sign` located into `artifacts/components` are copied into the corresponding cage to `/builder/dependencies/components` using the same directory structure.
+This example shows how to specify multiple dependencies for different stages (build and sign) under a given distribution.
