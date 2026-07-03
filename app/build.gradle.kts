@@ -127,4 +127,10 @@ dependencies {
   debugImplementation(libs.androidx.compose.ui.tooling)
   "ksp"(libs.androidx.room.compiler)
   "ksp"(libs.moshi.kotlin.codegen)
+  implementation(libs.keepassjava2)
 }
+
+configurations.all {
+    exclude(group = "com.google.guava", module = "listenablefuture")
+}
+

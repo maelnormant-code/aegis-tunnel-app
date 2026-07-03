@@ -1,5 +1,8 @@
 package com.example
 
+import android.app.Application
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -20,32 +23,9 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.Notes
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
-import androidx.compose.material.icons.filled.Folder
-import androidx.compose.material.icons.filled.Key
-import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.CreditCard
-import androidx.compose.material.icons.filled.Terminal
-import androidx.compose.material.icons.filled.QrCodeScanner
-import androidx.compose.material.icons.filled.LockOpen
-import androidx.compose.material.icons.filled.Password
-import androidx.compose.material.icons.filled.AccountCircle
-import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.filled.NetworkWifi
-import androidx.compose.material.icons.filled.Security
-import androidx.compose.material.icons.filled.VpnKey
-import androidx.compose.material.icons.filled.Dns
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Image
-import androidx.compose.material.icons.filled.Cloud
-import androidx.compose.material.icons.filled.AccountBalanceWallet
-import androidx.compose.material.icons.filled.Link
-import androidx.compose.material.icons.filled.Public
-import androidx.compose.material.icons.filled.Route
-import androidx.compose.material.icons.filled.Tune
-import androidx.compose.material.icons.filled.ArrowForward
-import androidx.compose.material.icons.filled.AppShortcut
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -60,13 +40,17 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import retrofit2.http.POST
 import retrofit2.http.GET
@@ -78,30 +62,16 @@ import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.util.concurrent.TimeUnit
 
-interface AegisApiService {
-    @POST("api/chat")
-    suspend fun sendChat(@Body request: ChatRequest): ChatResponse
+import com.example.data.db.AppDatabase
+import com.example.data.db.ChatMessage
+import com.example.data.db.RoutingRule
+import com.example.data.api.HeimdallRepository
+import com.example.data.vpn.WireGuardManager
+import com.example.data.local.PasswordGenerator
+import com.example.service.RoutingVpnService
 
-    @POST("api/goal")
-    suspend fun sendGoal(@Body request: GoalRequest): GoalResponse
+// Aegis network service is located in com.example.data.api.HeimdallApiService
 
-    @GET("api/status")
-    suspend fun checkStatus(): StatusResponse
-}
-
-data class ChatRequest(val query: String)
-data class ChatResponse(val status: String, val response: String? = null, val message: String? = null)
-
-data class GoalRequest(val goal: String)
-data class GoalResponse(val status: String, val response: String? = null, val message: String? = null)
-
-data class StatusResponse(
-    val status: String,
-    val wireguard: String? = null,
-    val syncthing: String? = null,
-    val aegis_node: String? = null,
-    val api_version: String? = null
-)
 
 enum class RoutingProtocol(val title: String, val icon: ImageVector) {
     SYS_VPN("sys-vpn (WireGuard)", Icons.Default.VpnKey),
@@ -241,9 +211,34 @@ fun parseAegisQrCode(scannedContent: String): ParseResult {
     return ParseResult.Unknown(content = trimmed)
 }
 
-class ChatViewModel : ViewModel() {
-    private val _messages = MutableStateFlow<List<Message>>(emptyList())
-    val messages: StateFlow<List<Message>> = _messages.asStateFlow()
+class ChatViewModel(application: Application) : AndroidViewModel(application) {
+    private val db = AppDatabase.getDatabase(application)
+    private val chatDao = db.chatMessageDao()
+    private val routingDao = db.routingRuleDao()
+    private val repository = HeimdallRepository()
+
+    val messages: StateFlow<List<Message>> = chatDao.getAllMessages().map { list ->
+        list.map { entity ->
+            Message(
+                id = entity.id,
+                text = entity.text,
+                isFromMe = entity.isFromMe,
+                timestamp = entity.timestamp,
+                isEncrypted = entity.isEncrypted,
+                protocolName = entity.protocolName
+            )
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = emptyList()
+    )
+
+    val routingRules: StateFlow<List<RoutingRule>> = routingDao.getAllRules().stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = emptyList()
+    )
 
     private val _currentProtocol = MutableStateFlow(RoutingProtocol.SYS_VPN)
     val currentProtocol: StateFlow<RoutingProtocol> = _currentProtocol.asStateFlow()
@@ -260,18 +255,28 @@ class ChatViewModel : ViewModel() {
     private val _totpTokens = MutableStateFlow<List<TotpToken>>(emptyList())
     val totpTokens: StateFlow<List<TotpToken>> = _totpTokens.asStateFlow()
 
-    private var cachedApiService: AegisApiService? = null
-
     init {
-        _messages.value = listOf(
-            Message("1", "Aegis Node handshake initialized.", false, getCurrentTime(), true, "sys-vpn (WireGuard)"),
-            Message("2", "Secure channel established via ${_currentProtocol.value.title}.", false, getCurrentTime(), true, _currentProtocol.value.title)
-        )
         _totpTokens.value = listOf(
             TotpToken("1", "sys-copilot Admin", "Qubes OS", "JBSWY3DPEHPK3PXP"),
             TotpToken("2", "Aegis Peer Gateway", "Aegis", "KVKVEV2VJVGVG666")
         )
-        // Probe and auto-detect real Qubes Aegis node connection
+
+        viewModelScope.launch {
+            val initialMsgs = chatDao.getAllMessages().first()
+            if (initialMsgs.isEmpty()) {
+                chatDao.insertMessage(ChatMessage("1", "Aegis Node handshake initialized.", false, getCurrentTime(), true, "sys-vpn (WireGuard)"))
+                chatDao.insertMessage(ChatMessage("2", "Secure channel established via ${_currentProtocol.value.title}.", false, getCurrentTime(), true, _currentProtocol.value.title))
+            }
+
+            val initialRules = routingDao.getAllRules().first()
+            if (initialRules.isEmpty()) {
+                routingDao.insertRule(RoutingRule("org.torproject.torbrowser", "DuckDuckGo Browser", "sys-whonix", "Use Mullvad VPN first", true))
+                routingDao.insertRule(RoutingRule("org.fennec.browser", "Fennec Browser", "sys-i2p", "Access .i2p hidden sites", true))
+                routingDao.insertRule(RoutingRule("com.bank", "Bank App", "sys-firewall", "Direct to App VM", true))
+                routingDao.insertRule(RoutingRule("org.thoughtcrime.securesms", "Signal", "sys-tor", "Direct to Tor VM", true))
+            }
+        }
+
         testConnection()
     }
 
@@ -328,33 +333,8 @@ class ChatViewModel : ViewModel() {
         return false
     }
 
-    private fun getApiService(): AegisApiService {
-        val url = serverUrl.value
-        val formattedUrl = if (url.endsWith("/")) url else "$url/"
-        return cachedApiService ?: synchronized(this) {
-            val okHttpClient = OkHttpClient.Builder()
-                .connectTimeout(5, TimeUnit.SECONDS)
-                .readTimeout(130, TimeUnit.SECONDS)
-                .writeTimeout(5, TimeUnit.SECONDS)
-                .build()
-
-            val moshi = Moshi.Builder()
-                .addLast(KotlinJsonAdapterFactory())
-                .build()
-
-            val retrofit = Retrofit.Builder()
-                .baseUrl(formattedUrl)
-                .client(okHttpClient)
-                .addConverterFactory(MoshiConverterFactory.create(moshi))
-                .build()
-
-            retrofit.create(AegisApiService::class.java).also { cachedApiService = it }
-        }
-    }
-
     fun updateServerUrl(newUrl: String) {
         serverUrl.value = newUrl
-        cachedApiService = null
         testConnection()
     }
 
@@ -364,22 +344,26 @@ class ChatViewModel : ViewModel() {
             testConnection()
         } else {
             _connectionStatus.value = "Offline (Simulated)"
-            _messages.value = _messages.value + Message(
-                id = System.currentTimeMillis().toString(),
-                text = "Switched to secure offline simulation mode.",
-                isFromMe = false,
-                timestamp = getCurrentTime(),
-                protocolName = _currentProtocol.value.title
-            )
+            viewModelScope.launch {
+                chatDao.insertMessage(
+                    ChatMessage(
+                        id = System.currentTimeMillis().toString(),
+                        text = "Switched to secure offline simulation mode.",
+                        isFromMe = false,
+                        timestamp = getCurrentTime(),
+                        isEncrypted = true,
+                        protocolName = _currentProtocol.value.title
+                    )
+                )
+            }
         }
     }
 
     fun testConnection(onResult: (Boolean, String) -> Unit = { _, _ -> }) {
         viewModelScope.launch {
             _connectionStatus.value = "Connecting to Aegis Node..."
-            try {
-                val service = getApiService()
-                val status = service.checkStatus()
+            val result = repository.checkStatus(serverUrl.value)
+            result.onSuccess { status ->
                 if (status.status == "ok") {
                     isSimulationMode.value = false
                     _connectionStatus.value = "Connected to ${status.aegis_node ?: "sys-vpn"}"
@@ -389,7 +373,7 @@ class ChatViewModel : ViewModel() {
                     isSimulationMode.value = true
                     onResult(false, "Gateway responded with invalid status.")
                 }
-            } catch (e: Exception) {
+            }.onFailure { e ->
                 _connectionStatus.value = "Offline (Simulated)"
                 isSimulationMode.value = true
                 onResult(false, "Could not reach gateway: ${e.localizedMessage ?: "Timeout"}")
@@ -404,12 +388,15 @@ class ChatViewModel : ViewModel() {
             _connectionStatus.value = "Reconnecting via $stateStr..."
             delay(1000)
             _connectionStatus.value = if (isSimulationMode.value) "Offline (Simulated)" else "Connected"
-            _messages.value = _messages.value + Message(
-                id = System.currentTimeMillis().toString(),
-                text = "Routing switched to ${protocol.title}. Tunnel secured.",
-                isFromMe = false,
-                timestamp = getCurrentTime(),
-                protocolName = protocol.title
+            chatDao.insertMessage(
+                ChatMessage(
+                    id = System.currentTimeMillis().toString(),
+                    text = "Routing switched to ${protocol.title}. Tunnel secured.",
+                    isFromMe = false,
+                    timestamp = getCurrentTime(),
+                    isEncrypted = true,
+                    protocolName = protocol.title
+                )
             )
         }
     }
@@ -421,12 +408,15 @@ class ChatViewModel : ViewModel() {
             _connectionStatus.value = "Reconnecting via $stateStr..."
             delay(1000)
             _connectionStatus.value = if (isSimulationMode.value) "Offline (Simulated)" else "Connected"
-            _messages.value = _messages.value + Message(
-                id = System.currentTimeMillis().toString(),
-                text = if (_mullvadEnabled.value) "Traffic now routed through Mullvad VPN prior to Aegis node." else "Mullvad VPN disconnected. Direct to Aegis node.",
-                isFromMe = false,
-                timestamp = getCurrentTime(),
-                protocolName = _currentProtocol.value.title
+            chatDao.insertMessage(
+                ChatMessage(
+                    id = System.currentTimeMillis().toString(),
+                    text = if (_mullvadEnabled.value) "Traffic now routed through Mullvad VPN prior to Aegis node." else "Mullvad VPN disconnected. Direct to Aegis node.",
+                    isFromMe = false,
+                    timestamp = getCurrentTime(),
+                    isEncrypted = true,
+                    protocolName = _currentProtocol.value.title
+                )
             )
         }
     }
@@ -435,60 +425,98 @@ class ChatViewModel : ViewModel() {
         if (text.isBlank()) return
         
         val currentProto = _currentProtocol.value.title
-        val userMsg = Message(
-            id = System.currentTimeMillis().toString(),
-            text = text,
-            isFromMe = true,
-            timestamp = getCurrentTime(),
-            protocolName = currentProto
-        )
-        _messages.value = _messages.value + userMsg
-
+        val userMsgId = System.currentTimeMillis().toString()
+        
         viewModelScope.launch {
-            if (isSimulationMode.value) {
-                delay(1000)
-                val replyMsg = Message(
-                    id = (System.currentTimeMillis() + 1).toString(),
-                    text = "[Encrypted Payload Acknowledged (Simulated)]\n\nHeimdall: Received query over simulated gateway tunnel. If you have setup aegis-tunnel-proxy in your sys-vpn VM, tap the Connection Settings icon in the top right to configure your live endpoint and test the active integration.",
-                    isFromMe = false,
+            chatDao.insertMessage(
+                ChatMessage(
+                    id = userMsgId,
+                    text = text,
+                    isFromMe = true,
                     timestamp = getCurrentTime(),
+                    isEncrypted = true,
                     protocolName = currentProto
                 )
-                _messages.value = _messages.value + replyMsg
-            } else {
-                _connectionStatus.value = "Aegis Node processing query..."
-                try {
-                    val service = getApiService()
-                    val responseText = if (text.startsWith("/goal ")) {
-                        val goalQuery = text.substring(6).trim()
-                        val response = service.sendGoal(GoalRequest(goalQuery))
-                        response.response ?: response.message ?: "Goal loop terminated with no response payload."
-                    } else {
-                        val response = service.sendChat(ChatRequest(text))
-                        response.response ?: response.message ?: "Encrypted payload acknowledged."
-                    }
+            )
 
-                    _messages.value = _messages.value + Message(
+            if (isSimulationMode.value) {
+                delay(1000)
+                chatDao.insertMessage(
+                    ChatMessage(
                         id = (System.currentTimeMillis() + 1).toString(),
-                        text = responseText,
+                        text = "[Encrypted Payload Acknowledged (Simulated)]\n\nHeimdall: Received query over simulated gateway tunnel. If you have setup aegis-tunnel-proxy in your sys-vpn VM, tap the Connection Settings icon in the top right to configure your live endpoint and test the active integration.",
                         isFromMe = false,
                         timestamp = getCurrentTime(),
+                        isEncrypted = true,
                         protocolName = currentProto
                     )
+                )
+            } else {
+                _connectionStatus.value = "Aegis Node processing query..."
+                val responseResult = if (text.startsWith("/goal ")) {
+                    val goalQuery = text.substring(6).trim()
+                    repository.sendGoal(serverUrl.value, goalQuery)
+                } else {
+                    repository.sendChat(serverUrl.value, text)
+                }
+
+                responseResult.onSuccess { responseText ->
+                    chatDao.insertMessage(
+                        ChatMessage(
+                            id = (System.currentTimeMillis() + 1).toString(),
+                            text = responseText,
+                            isFromMe = false,
+                            timestamp = getCurrentTime(),
+                            isEncrypted = true,
+                            protocolName = currentProto
+                        )
+                    )
                     _connectionStatus.value = "Connected to sys-vpn"
-                } catch (e: Exception) {
+                }.onFailure { e ->
                     _connectionStatus.value = "Connection Lost"
-                    _messages.value = _messages.value + Message(
-                        id = (System.currentTimeMillis() + 1).toString(),
-                        text = "Transmission error: Unable to contact Aegis Gateway Peer at ${serverUrl.value}. ${e.localizedMessage ?: "Endpoint connection refused."}\n\nFalling back to offline simulation mode.",
-                        isFromMe = false,
-                        timestamp = getCurrentTime(),
-                        protocolName = currentProto
+                    chatDao.insertMessage(
+                        ChatMessage(
+                            id = (System.currentTimeMillis() + 1).toString(),
+                            text = "Transmission error: Unable to contact Aegis Gateway Peer at ${serverUrl.value}. ${e.localizedMessage ?: "Endpoint connection refused."}\n\nFalling back to offline simulation mode.",
+                            isFromMe = false,
+                            timestamp = getCurrentTime(),
+                            isEncrypted = true,
+                            protocolName = currentProto
+                        )
                     )
                     isSimulationMode.value = true
                 }
             }
         }
+    }
+
+    fun toggleRoutingRule(packageName: String, enabled: Boolean) {
+        viewModelScope.launch {
+            routingDao.updateRuleEnabled(packageName, enabled)
+        }
+    }
+
+    fun addRoutingRule(packageName: String, appName: String, destination: String, notes: String = "") {
+        viewModelScope.launch {
+            routingDao.insertRule(RoutingRule(packageName, appName, destination, notes, true))
+        }
+    }
+
+    fun deleteRoutingRule(packageName: String) {
+        viewModelScope.launch {
+            routingDao.deleteRule(packageName)
+        }
+    }
+
+    fun getInstalledApps(): List<Pair<String, String>> {
+        val pm = getApplication<Application>().packageManager
+        val apps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
+        return apps.map { app ->
+            val name = pm.getApplicationLabel(app).toString()
+            val pkg = app.packageName
+            Pair(name, pkg)
+        }.filter { it.second != getApplication<Application>().packageName }
+         .sortedBy { it.first }
     }
 
     private fun getCurrentTime(): String {
@@ -806,7 +834,7 @@ fun AegisApp() {
                                     .client(OkHttpClient.Builder().connectTimeout(3, TimeUnit.SECONDS).build())
                                     .addConverterFactory(MoshiConverterFactory.create(Moshi.Builder().addLast(KotlinJsonAdapterFactory()).build()))
                                     .build()
-                                    .create(AegisApiService::class.java)
+                                    .create(com.example.data.api.HeimdallApiService::class.java)
                                     
                                 viewModel.viewModelScope.launch {
                                     try {
@@ -975,7 +1003,7 @@ fun AegisApp() {
         } else if (currentTab == "Services") {
             ServicesScreen(paddingValues)
         } else {
-            RoutingScreen(paddingValues)
+            RoutingScreen(paddingValues, viewModel)
         }
     }
 }
@@ -1066,9 +1094,83 @@ fun KeePassVaultScreen(
     var password by remember { mutableStateOf("") }
     var autofillEnabled by remember { mutableStateOf(false) }
     var showManualDialog by remember { mutableStateOf(false) }
+    var selectedCategory by remember { mutableStateOf<String?>(null) }
+    
+    val defaultEntries = remember {
+        listOf(
+            com.example.data.model.VaultEntry(
+                id = "1",
+                title = "sys-vpn WireGuard Certification Client",
+                username = "qubes-wg-client",
+                password = "aegis_secure_client_token_99812",
+                url = "10.137.0.1",
+                notes = "Credentials to connect sys-copilot client to the desktop server",
+                category = "Logins"
+            ),
+            com.example.data.model.VaultEntry(
+                id = "2",
+                title = "Heimdall API Authorization Key",
+                username = "admin",
+                password = "copilot_heimdall_token_b5327a",
+                url = "http://10.137.0.1:5000",
+                notes = "Primary API authorization token for sys-copilot control calls",
+                category = "Logins"
+            ),
+            com.example.data.model.VaultEntry(
+                id = "3",
+                title = "sys-tor SSH Identity Private Key",
+                username = "user",
+                password = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDQg6...",
+                url = "sys-tor.local",
+                notes = "Onion gateway SSH authentication key",
+                category = "SSH Keys"
+            ),
+            com.example.data.model.VaultEntry(
+                id = "4",
+                title = "Aegis Backup Cold Wallet Wallet-Seed",
+                username = "monero-cold",
+                password = "seed: alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima",
+                url = "XMR Wallet",
+                notes = "Recovery seed for native monero node wallet storage",
+                category = "Secure Notes"
+            ),
+            com.example.data.model.VaultEntry(
+                id = "5",
+                title = "Aegis Primary Crypto Debit Card",
+                username = "Aegis Holder",
+                password = "4532 9982 1102 7731",
+                url = "",
+                notes = "Exp: 12/30, CVV: 432",
+                category = "Credit & Debit Cards"
+            )
+        )
+    }
+
+    var decryptedEntries by remember { mutableStateOf<List<com.example.data.model.VaultEntry>>(defaultEntries) }
     
     val totpTokens by viewModel.totpTokens.collectAsState()
     val context = androidx.compose.ui.platform.LocalContext.current
+    
+    // Storage access framework launcher to pick KDBX files
+    val filePickerLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.GetContent()
+    ) { uri ->
+        uri?.let {
+            try {
+                val inputStream = context.contentResolver.openInputStream(it)
+                if (inputStream != null) {
+                    val entries = com.example.data.local.KeePassManager.decryptVault(inputStream, password)
+                    decryptedEntries = entries
+                    isUnlocked = true
+                    android.widget.Toast.makeText(context, "Loaded ${entries.size} entries from vault!", android.widget.Toast.LENGTH_SHORT).show()
+                } else {
+                    android.widget.Toast.makeText(context, "Could not open vault file stream.", android.widget.Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                android.widget.Toast.makeText(context, "Decryption failed: ${e.localizedMessage ?: "Invalid password"}", android.widget.Toast.LENGTH_LONG).show()
+            }
+        }
+    }
     
     // Live ticking timer for TOTP regeneration and progress bars
     var currentTimeSeconds by remember { mutableStateOf(System.currentTimeMillis() / 1000) }
@@ -1119,7 +1221,7 @@ fun KeePassVaultScreen(
             OutlinedTextField(
                 value = password,
                 onValueChange = { password = it },
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().testTag("vault_password_input"),
                 placeholder = { Text("Master Password...") },
                 visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
                 keyboardOptions = KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Password),
@@ -1133,13 +1235,35 @@ fun KeePassVaultScreen(
                 }
             )
             
-            Button(
-                onClick = { isUnlocked = true },
-                modifier = Modifier.fillMaxWidth().height(48.dp),
-                shape = RoundedCornerShape(24.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-            ) {
-                Text("Unlock Database", fontWeight = FontWeight.Bold)
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = { 
+                        isUnlocked = true 
+                        decryptedEntries = defaultEntries
+                    },
+                    modifier = Modifier.weight(1f).height(48.dp).testTag("unlock_vault_button"),
+                    shape = RoundedCornerShape(24.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                ) {
+                    Text("Unlock Default", fontWeight = FontWeight.Bold)
+                }
+                
+                Button(
+                    onClick = { 
+                        if (password.isBlank()) {
+                            android.widget.Toast.makeText(context, "Enter master password first", android.widget.Toast.LENGTH_SHORT).show()
+                        } else {
+                            filePickerLauncher.launch("*/*")
+                        }
+                    },
+                    modifier = Modifier.weight(1f).height(48.dp).testTag("import_vault_button"),
+                    shape = RoundedCornerShape(24.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+                ) {
+                    Icon(Icons.Default.UploadFile, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Open File", fontWeight = FontWeight.Bold)
+                }
             }
             
             Spacer(modifier = Modifier.height(8.dp))
@@ -1194,17 +1318,136 @@ fun KeePassVaultScreen(
 
             PasswordGeneratorCard()
 
-            Text("Categories", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 8.dp, start = 4.dp))
+            if (selectedCategory == null) {
+                Text("Categories", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(top = 8.dp, start = 4.dp))
 
-            val categories = listOf(
-                Pair("Logins", Icons.Default.AccountCircle),
-                Pair("Credit & Debit Cards", Icons.Default.CreditCard),
-                Pair("SSH Keys", Icons.Default.Terminal),
-                Pair("Secure Notes", Icons.AutoMirrored.Filled.Notes)
-            )
+                val categories = listOf(
+                    Pair("Logins", Icons.Default.AccountCircle),
+                    Pair("Credit & Debit Cards", Icons.Default.CreditCard),
+                    Pair("SSH Keys", Icons.Default.Terminal),
+                    Pair("Secure Notes", Icons.AutoMirrored.Filled.Notes)
+                )
 
-            categories.forEach { (title, icon) ->
-                VaultCategoryCard(title, icon)
+                categories.forEach { (title, icon) ->
+                    Surface(
+                        modifier = Modifier.fillMaxWidth().clickable { selectedCategory = title },
+                        color = MaterialTheme.colorScheme.surface,
+                        shadowElevation = 2.dp,
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.1f), RoundedCornerShape(10.dp)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(icon, contentDescription = title, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+                            }
+                            Spacer(modifier = Modifier.width(16.dp))
+                            Column {
+                                Text(title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
+                                val count = decryptedEntries.count { it.category == title }
+                                Text("$count entries", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Spacer(modifier = Modifier.weight(1f))
+                            Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = "View", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
+            } else {
+                // Showing Category Detail list
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(onClick = { selectedCategory = null }) {
+                            Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(selectedCategory ?: "Entries", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                val filtered = decryptedEntries.filter { it.category == selectedCategory }
+                if (filtered.isEmpty()) {
+                    Text("No credentials saved in this category.", style = MaterialTheme.typography.bodySmall, color = Color.Gray, modifier = Modifier.padding(16.dp))
+                } else {
+                    filtered.forEach { entry ->
+                        var showDetails by remember { mutableStateOf(false) }
+                        var showPassword by remember { mutableStateOf(false) }
+
+                        Surface(
+                            modifier = Modifier.fillMaxWidth().clickable { showDetails = !showDetails },
+                            color = MaterialTheme.colorScheme.surface,
+                            shadowElevation = 2.dp,
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(entry.title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold)
+                                        if (entry.username.isNotEmpty()) {
+                                            Text(entry.username, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        }
+                                    }
+                                    Icon(
+                                        if (showDetails) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                                        contentDescription = null
+                                    )
+                                }
+
+                                if (showDetails) {
+                                    HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
+
+                                    if (entry.password.isNotEmpty()) {
+                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                                            Column {
+                                                Text("Secret / Password", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                Text(
+                                                    if (showPassword) entry.password else "••••••••••••",
+                                                    style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace)
+                                                )
+                                            }
+                                            Row {
+                                                IconButton(onClick = { showPassword = !showPassword }) {
+                                                    Icon(if (showPassword) Icons.Default.VisibilityOff else Icons.Default.Visibility, contentDescription = null)
+                                                }
+                                                IconButton(onClick = {
+                                                    val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                                    val clip = android.content.ClipData.newPlainText("Vault Password", entry.password)
+                                                    clipboard.setPrimaryClip(clip)
+                                                    android.widget.Toast.makeText(context, "Password copied!", android.widget.Toast.LENGTH_SHORT).show()
+                                                }) {
+                                                    Icon(Icons.Default.ContentCopy, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if (entry.url.isNotEmpty()) {
+                                        Column {
+                                            Text("URL", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            Text(entry.url, style = MaterialTheme.typography.bodyMedium)
+                                        }
+                                    }
+
+                                    if (entry.notes.isNotEmpty()) {
+                                        Column {
+                                            Text("Notes", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            Text(entry.notes, style = MaterialTheme.typography.bodySmall)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             
             // Authenticator (TOTP) Section
@@ -1441,6 +1684,7 @@ fun PasswordGeneratorCard() {
     var useSpecials by remember { mutableStateOf(true) }
     
     var generatedPassword by remember { mutableStateOf("A8#mK9!vL2\$pQ5*x") }
+    val context = androidx.compose.ui.platform.LocalContext.current
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -1462,7 +1706,15 @@ fun PasswordGeneratorCard() {
             ) {
                 Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text(generatedPassword, style = MaterialTheme.typography.bodyLarge.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace), modifier = Modifier.weight(1f))
-                    IconButton(onClick = {}, modifier = Modifier.size(24.dp)) {
+                    IconButton(
+                        onClick = {
+                            val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                            val clip = android.content.ClipData.newPlainText("Generated Password", generatedPassword)
+                            clipboard.setPrimaryClip(clip)
+                            android.widget.Toast.makeText(context, "Password copied to clipboard!", android.widget.Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier.size(24.dp)
+                    ) {
                         Icon(Icons.Default.ContentCopy, contentDescription = "Copy", tint = MaterialTheme.colorScheme.primary)
                     }
                 }
@@ -1505,7 +1757,15 @@ fun PasswordGeneratorCard() {
             }
             
             Button(
-                onClick = { /* Generate logic */ }, 
+                onClick = {
+                    generatedPassword = PasswordGenerator.generate(
+                        length = length.toInt(),
+                        useUpper = useUpper,
+                        useLower = useLower,
+                        useNumbers = useNumbers,
+                        useSpecials = useSpecials
+                    )
+                }, 
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primaryContainer, contentColor = MaterialTheme.colorScheme.onPrimaryContainer)
             ) {
@@ -1595,7 +1855,10 @@ fun ServiceCard(title: String, desc: String, icon: androidx.compose.ui.graphics.
 }
 
 @Composable
-fun RoutingScreen(paddingValues: PaddingValues) {
+fun RoutingScreen(paddingValues: PaddingValues, viewModel: ChatViewModel) {
+    val rules by viewModel.routingRules.collectAsState()
+    var showAddDialog by remember { mutableStateOf(false) }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -1608,16 +1871,23 @@ fun RoutingScreen(paddingValues: PaddingValues) {
         
         Text("Route specific Android apps traffic to specific qubes over the private VPN (WireGuard).", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         
-        RoutingRuleCard("DuckDuckGo Browser", "sys-whonix", "Use Mullvad VPN first", Icons.Default.Search)
-        RoutingRuleCard("Fennec Browser", "sys-i2p", "Access .i2p hidden sites", Icons.Default.Public)
-        RoutingRuleCard("Bank App", "sys-firewall", "Direct to App VM", Icons.Default.AccountBalanceWallet)
-        RoutingRuleCard("Signal", "sys-tor", "Direct to Tor VM", Icons.AutoMirrored.Filled.Chat)
+        rules.forEach { rule ->
+            RoutingRuleCard(
+                rule = rule,
+                onToggle = { isEnabled ->
+                    viewModel.toggleRoutingRule(rule.packageName, isEnabled)
+                },
+                onDelete = {
+                    viewModel.deleteRoutingRule(rule.packageName)
+                }
+            )
+        }
         
         Spacer(modifier = Modifier.height(16.dp))
         
         Button(
-            onClick = {},
-            modifier = Modifier.fillMaxWidth().height(48.dp),
+            onClick = { showAddDialog = true },
+            modifier = Modifier.fillMaxWidth().height(48.dp).testTag("add_routing_rule_button"),
             shape = RoundedCornerShape(24.dp),
             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primaryContainer, contentColor = MaterialTheme.colorScheme.onPrimaryContainer)
         ) {
@@ -1626,11 +1896,143 @@ fun RoutingScreen(paddingValues: PaddingValues) {
             Text("Add Routing Rule", fontWeight = FontWeight.SemiBold)
         }
     }
+
+    if (showAddDialog) {
+        val installedApps = remember { viewModel.getInstalledApps() }
+        var selectedApp by remember { mutableStateOf<Pair<String, String>?>(null) }
+        var dropdownExpanded by remember { mutableStateOf(false) }
+        var destination by remember { mutableStateOf("sys-whonix") }
+        var notes by remember { mutableStateOf("") }
+        var customPackageName by remember { mutableStateOf("") }
+        var customAppName by remember { mutableStateOf("") }
+        var isCustom by remember { mutableStateOf(false) }
+
+        AlertDialog(
+            onDismissRequest = { showAddDialog = false },
+            title = { Text("Add Routing Rule", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = { isCustom = false },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (!isCustom) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
+                                contentColor = if (!isCustom) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+                            ),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Installed Apps", style = MaterialTheme.typography.labelMedium)
+                        }
+                        Button(
+                            onClick = { isCustom = true },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (isCustom) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
+                                contentColor = if (isCustom) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+                            ),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Custom Package", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+
+                    if (!isCustom) {
+                        Box(modifier = Modifier.fillMaxWidth()) {
+                            OutlinedTextField(
+                                value = selectedApp?.first ?: "Select Android App...",
+                                onValueChange = {},
+                                readOnly = true,
+                                modifier = Modifier.fillMaxWidth().clickable { dropdownExpanded = true }.testTag("app_select_input"),
+                                label = { Text("App") },
+                                trailingIcon = {
+                                    IconButton(onClick = { dropdownExpanded = true }) {
+                                        Icon(Icons.Default.ArrowDropDown, contentDescription = null)
+                                    }
+                                }
+                            )
+                            DropdownMenu(
+                                expanded = dropdownExpanded,
+                                onDismissRequest = { dropdownExpanded = false },
+                                modifier = Modifier.fillMaxWidth(0.9f).heightIn(max = 240.dp)
+                            ) {
+                                installedApps.forEach { app ->
+                                    DropdownMenuItem(
+                                        text = { Text("${app.first} (${app.second})") },
+                                        onClick = {
+                                            selectedApp = app
+                                            dropdownExpanded = false
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        OutlinedTextField(
+                            value = customAppName,
+                            onValueChange = { customAppName = it },
+                            label = { Text("App Name") },
+                            placeholder = { Text("My Custom App") },
+                            modifier = Modifier.fillMaxWidth().testTag("custom_app_name_input")
+                        )
+                        OutlinedTextField(
+                            value = customPackageName,
+                            onValueChange = { customPackageName = it },
+                            label = { Text("Package Name") },
+                            placeholder = { Text("com.custom.app") },
+                            modifier = Modifier.fillMaxWidth().testTag("custom_package_name_input")
+                        )
+                    }
+
+                    OutlinedTextField(
+                        value = destination,
+                        onValueChange = { destination = it },
+                        label = { Text("Destination Qube") },
+                        placeholder = { Text("sys-whonix") },
+                        modifier = Modifier.fillMaxWidth().testTag("destination_qube_input")
+                    )
+
+                    OutlinedTextField(
+                        value = notes,
+                        onValueChange = { notes = it },
+                        label = { Text("Notes / Description") },
+                        placeholder = { Text("Direct routing through Whonix") },
+                        modifier = Modifier.fillMaxWidth().testTag("rule_notes_input")
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val finalPkg = if (isCustom) customPackageName else selectedApp?.second
+                        val finalName = if (isCustom) customAppName else selectedApp?.first
+                        if (!finalPkg.isNullOrBlank() && !finalName.isNullOrBlank()) {
+                            viewModel.addRoutingRule(finalPkg, finalName, destination, notes)
+                            showAddDialog = false
+                        }
+                    },
+                    modifier = Modifier.testTag("save_rule_button")
+                ) {
+                    Text("Save Rule")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAddDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 }
 
 @Composable
-fun RoutingRuleCard(appName: String, destination: String, notes: String, icon: androidx.compose.ui.graphics.vector.ImageVector) {
-    var enabled by remember { mutableStateOf(true) }
+fun RoutingRuleCard(
+    rule: RoutingRule,
+    onToggle: (Boolean) -> Unit,
+    onDelete: () -> Unit
+) {
+    var enabled by remember(rule.isEnabled) { mutableStateOf(rule.isEnabled) }
     
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -1644,26 +2046,41 @@ fun RoutingRuleCard(appName: String, destination: String, notes: String, icon: a
                 horizontalArrangement = Arrangement.SpaceBetween,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
                     Box(
                         modifier = Modifier
                             .size(40.dp)
                             .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.1f), RoundedCornerShape(10.dp)),
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(icon, contentDescription = appName, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+                        val icon = when {
+                            rule.destination.contains("whonix") -> Icons.Default.Search
+                            rule.destination.contains("tor") -> Icons.Default.Public
+                            rule.destination.contains("i2p") -> Icons.Default.Security
+                            else -> Icons.Default.NetworkWifi
+                        }
+                        Icon(icon, contentDescription = rule.appName, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
                     }
                     Spacer(modifier = Modifier.width(16.dp))
                     Column {
-                        Text(appName, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
-                        Text("App Traffic Rule", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(rule.appName, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                        Text(rule.packageName, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
-                Switch(
-                    checked = enabled,
-                    onCheckedChange = { enabled = it },
-                    colors = SwitchDefaults.colors(checkedThumbColor = MaterialTheme.colorScheme.primary, checkedTrackColor = MaterialTheme.colorScheme.primaryContainer)
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Switch(
+                        checked = enabled,
+                        onCheckedChange = { 
+                            enabled = it
+                            onToggle(it)
+                        },
+                        colors = SwitchDefaults.colors(checkedThumbColor = MaterialTheme.colorScheme.primary, checkedTrackColor = MaterialTheme.colorScheme.primaryContainer)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    IconButton(onClick = onDelete, modifier = Modifier.size(32.dp).testTag("delete_rule_${rule.packageName}")) {
+                        Icon(Icons.Default.Delete, contentDescription = "Delete Rule", tint = MaterialTheme.colorScheme.error)
+                    }
+                }
             }
             
             Spacer(modifier = Modifier.height(16.dp))
@@ -1674,7 +2091,7 @@ fun RoutingRuleCard(appName: String, destination: String, notes: String, icon: a
                 shape = RoundedCornerShape(8.dp)
             ) {
                 Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    RoutingStep("Android App", appName, Icons.Default.AppShortcut)
+                    RoutingStep("Android App", rule.appName, Icons.Default.AppShortcut)
                     RoutingPath()
                     RoutingStep("Optional Outward VPN", "Mullvad", Icons.Default.Security)
                     RoutingPath()
@@ -1682,11 +2099,11 @@ fun RoutingRuleCard(appName: String, destination: String, notes: String, icon: a
                     RoutingPath()
                     RoutingStep("Private VPN", "app-wireguard-server", Icons.Default.VpnKey)
                     RoutingPath()
-                    RoutingStep("Destination Qube", destination, Icons.Default.Dns)
+                    RoutingStep("Destination Qube", rule.destination, Icons.Default.Dns)
                     
-                    if (notes.isNotEmpty()) {
+                    if (rule.notes.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(4.dp))
-                        Text(notes, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 28.dp))
+                        Text(rule.notes, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 28.dp))
                     }
                 }
             }
